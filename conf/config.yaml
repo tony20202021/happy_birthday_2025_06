@@ -54,7 +54,7 @@ diffusion:
     base_picture: "fun, joyful, happy"
     
     # Стилистические указания
-    style: "comix, digital art, professional, masterpiece, best quality"
+    style: "cartoon, digital art, professional, masterpiece, best quality"
     
     # Описание главного персонажа
     subject: "young beautiful woman named Evelina, dark long hair, big eyes"

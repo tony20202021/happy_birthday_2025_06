@@ -1,6 +1,5 @@
 """
-Модуль обработчиков сообщений для Birthday Bot.
-Содержит обработчики команд и различных типов сообщений.
+Обновленный модуль обработчиков с функционалом отправки копий администратору.
 """
 
 import asyncio
@@ -8,6 +7,7 @@ import time
 import shutil
 from pathlib import Path
 from typing import Any, List
+import re
 
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
@@ -44,13 +44,95 @@ def get_image_generator():
     global image_generator
     if image_generator is None:
         try:
-            # Создаем генератор без callback - он будет установлен позже
             image_generator = ImageGenerator()
             logger.info("✅ Модуль генерации изображений инициализирован")
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации генератора изображений: {e}")
             image_generator = None
     return image_generator
+
+async def send_to_admin(bot, images_dir: str, user_message: Message, original_text: str, is_voice: bool = False) -> None:
+    """
+    Отправка копии результата администратору.
+    
+    Args:
+        bot: Экземпляр бота
+        images_dir: Путь к директории с изображениями
+        user_message: Исходное сообщение пользователя
+        original_text: Текст поздравления
+        is_voice: True если исходное сообщение было голосовым
+    """
+    if not config.bot.admin_user_id:
+        logger.debug("🔇 Admin ID не настроен, пропускаем отправку администратору")
+        return
+    
+    try:
+        user_info = user_message.from_user
+        user_name = user_info.full_name
+        username = f"@{user_info.username}" if user_info.username else "без username"
+        
+        # Формируем заголовок для администратора
+        def escape_md(text: str) -> str:
+            return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', text)
+
+        username_safe = escape_md(username)
+        original_text_safe = escape_md(original_text[:500])
+        admin_caption = (
+            f"👤 *Пользователь:* ||{username_safe}||\n"
+            f"💬 *Текст:*\n"
+            f"||{original_text_safe}{'...' if len(original_text) > 500 else ''}||"
+        )
+
+        # Получаем пути ко всем изображениям
+        generator = get_image_generator()
+        if not generator:
+            logger.error("❌ Генератор изображений недоступен для отправки администратору")
+            return
+            
+        image_paths = generator.get_image_paths_from_dir(images_dir)
+        
+        if not image_paths:
+            logger.error(f"❌ Не найдено изображений для отправки администратору: {images_dir}")
+            return
+        
+        logger.info(f"📤 Отправка копии администратору (ID: {config.bot.admin_user_id})")
+        
+        # Если одно изображение - отправляем как обычное фото
+        if len(image_paths) == 1:
+            photo = FSInputFile(image_paths[0])
+            await bot.send_photo(
+                chat_id=config.bot.admin_user_id,
+                photo=photo,
+                caption=admin_caption,
+                parse_mode="MarkdownV2"
+            )
+            logger.info("✅ Копия отправлена администратору (одно изображение)")
+            return
+        
+        # Если несколько изображений - отправляем как медиа-группу
+        media_group = []
+        for i, image_path in enumerate(image_paths):
+            # Первое изображение с подписью, остальные без
+            caption = admin_caption if i == 0 else None
+            
+            media_group.append(
+                InputMediaPhoto(
+                    media=FSInputFile(image_path),
+                    caption=caption,
+                    parse_mode="MarkdownV2" if caption else None
+                )
+            )
+        
+        # Отправляем медиа-группу
+        await bot.send_media_group(
+            chat_id=config.bot.admin_user_id,
+            media=media_group
+        )
+        logger.info(f"✅ Копия отправлена администратору (медиа-группа из {len(image_paths)} изображений)")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки копии администратору: {e}")
+        # Не прерываем основной процесс из-за ошибки отправки администратору
 
 async def send_media_group_from_directory(message: Message, images_dir: str) -> bool:
     """
@@ -111,43 +193,28 @@ async def send_media_group_from_directory(message: Message, images_dir: str) -> 
         return False
 
 async def create_progress_callback(message: Message):
-    """
-    Создание callback функции для отправки сообщений о прогрессе.
-    
-    Args:
-        message: Сообщение пользователя для ответа
-        
-    Returns:
-        Функция callback для отправки прогресса
-    """
-    progress_messages = {}  # Словарь для хранения ID сообщений о прогрессе
+    """Создание callback функции для отправки сообщений о прогрессе."""
+    progress_messages = {}
     
     async def progress_callback(message_key: str, **kwargs):
         try:
             progress_text = BOT_MESSAGES["progress"][message_key].format(**kwargs)
             
-            # Если это начало этапа - отправляем новое сообщение
             if message_key.endswith("_start"):
                 progress_msg = await message.answer(progress_text, parse_mode="HTML")
                 progress_messages[message_key] = progress_msg.message_id
             
-            # Если это завершение этапа - редактируем существующее сообщение
             elif message_key.endswith("_done"):
                 start_key = message_key.replace("_done", "_start")
                 if start_key in progress_messages:
                     try:
                         await message.bot.answer(
                             text=progress_text,
-                            # chat_id=message.chat.id,
-                            # message_id=progress_messages[start_key],
                             parse_mode="HTML"
                         )
                     except Exception as e:
                         logger.debug(f"Не удалось отредактировать сообщение: {e}")
-                        # Если не удалось отредактировать, отправляем новое
                         await message.answer(progress_text, parse_mode="HTML")
-            
-            # Для других типов сообщений
             else:
                 await message.answer(progress_text, parse_mode="HTML")
                 
@@ -161,7 +228,6 @@ def get_expected_speech_time(duration_seconds: int) -> int:
     model_name = config.speech.model_name
     device = config.speech.device
     
-    # Базовое время обработки в зависимости от модели и устройства
     if device == "cuda":
         base_multiplier = {
             "tiny": 0.01,
@@ -180,30 +246,12 @@ def get_expected_speech_time(duration_seconds: int) -> int:
         }
     
     multiplier = base_multiplier.get(model_name, 1.0)
-    expected_time = int((duration_seconds + 1) * multiplier)  # +5 сек на загрузку
+    expected_time = int((duration_seconds + 1) * multiplier)
     
-    return max(expected_time, 3)  # Минимум 3 секунды
+    return max(expected_time, 3)
 
 def cleanup_images_directory(images_dir: str) -> None:
-    """
-    Очистка директории с изображениями.
-    
-    Args:
-        images_dir: Путь к директории для удаления
-    """
-    try:
-        dir_path = Path(images_dir)
-        if dir_path.exists() and dir_path.is_dir():
-            shutil.rmtree(dir_path)
-            logger.debug(f"🗑️ Удалена директория: {images_dir}")
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось удалить директорию {images_dir}: {e}")
-    """
-    Очистка директории с изображениями.
-    
-    Args:
-        images_dir: Путь к директории для удаления
-    """
+    """Очистка директории с изображениями."""
     try:
         dir_path = Path(images_dir)
         if dir_path.exists() and dir_path.is_dir():
@@ -213,26 +261,14 @@ def cleanup_images_directory(images_dir: str) -> None:
         logger.warning(f"⚠️ Не удалось удалить директорию {images_dir}: {e}")
 
 async def cmd_start(message: Message, state: FSMContext):
-    """
-    Обработчик команды /start.
-    
-    Args:
-        message: Сообщение пользователя
-        state: Состояние FSM
-    """
+    """Обработчик команды /start."""
     try:
-        # Очищаем состояние пользователя
         await state.clear()
         
-        # Логируем взаимодействие
         user_info = f"{message.from_user.full_name} (@{message.from_user.username or 'unknown'})"
         logger.info(f"👤 Пользователь {user_info} выполнил START_COMMAND")
         
-        # Отправляем приветственное сообщение
-        await message.answer(
-            BOT_MESSAGES["start"],
-            parse_mode="HTML"
-        )
+        await message.answer(BOT_MESSAGES["start"], parse_mode="HTML")
         
         logger.info(f"✅ Отправлено приветствие пользователю {message.from_user.full_name}")
         
@@ -241,22 +277,12 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(BOT_MESSAGES["error"])
 
 async def cmd_help(message: Message):
-    """
-    Обработчик команды /help.
-    
-    Args:
-        message: Сообщение пользователя
-    """
+    """Обработчик команды /help."""
     try:
-        # Логируем взаимодействие
         user_info = f"{message.from_user.full_name} (@{message.from_user.username or 'unknown'})"
         logger.info(f"👤 Пользователь {user_info} выполнил HELP_COMMAND")
         
-        # Отправляем справочное сообщение
-        await message.answer(
-            BOT_MESSAGES["help"],
-            parse_mode="HTML"
-        )
+        await message.answer(BOT_MESSAGES["help"], parse_mode="HTML")
         
         logger.info(f"✅ Отправлена справка пользователю {message.from_user.full_name}")
         
@@ -265,47 +291,46 @@ async def cmd_help(message: Message):
         await message.answer(BOT_MESSAGES["error"])
 
 async def handle_text_message(message: Message):
-    """
-    Обработчик текстовых сообщений.
-    
-    Args:
-        message: Текстовое сообщение пользователя
-    """
+    """Обработчик текстовых сообщений."""
     start_time = time.time()
     
     try:
-        # Логируем получение текстового сообщения
         text_preview = message.text[:50] + "..." if len(message.text) > 50 else message.text
         logger.info(f"📝 Пользователь {message.from_user.full_name} отправил TEXT_MESSAGE длиной {len(message.text)} символов")
         logger.debug(f"   Текст: {text_preview}")
         
-        # Отправляем сообщение о начале обработки
         progress_callback = await create_progress_callback(message)
         
-        # Генерируем изображения
         generator = get_image_generator()
         if not generator:
             await message.answer("❌ Сервис генерации изображений временно недоступен. Попробуйте позже.")
             logger.error(f"❌ Генератор изображений недоступен для пользователя {message.from_user.full_name}")
             return
         
-        # Устанавливаем callback для прогресса
         generator.progress_callback = progress_callback
         
-        # Генерируем изображения (возвращается путь к директории)
+        # Генерируем изображения
         images_dir = await generator.generate_birthday_image(message.text, message.from_user.id)
         
         if images_dir and Path(images_dir).exists():
-            # Отправляем сообщение об отправке
             await progress_callback("sending_images")
             
-            # Отправляем сгенерированные изображения
-            success = await send_media_group_from_directory(message, images_dir)            
+            # Отправляем пользователю
+            success = await send_media_group_from_directory(message, images_dir)
+            
             if success:
                 processing_time = time.time() - start_time
                 logger.info(f"✅ Изображения успешно сгенерированы и отправлены пользователю {message.from_user.full_name} за {processing_time:.2f}с")
                 
-                # Логируем статистику генерации изображения
+                # НОВОЕ: Отправляем копию администратору
+                await send_to_admin(
+                    bot=message.bot,
+                    images_dir=images_dir,
+                    user_message=message,
+                    original_text=message.text,
+                    is_voice=False
+                )
+                
                 logger.info(
                     f"user_id={message.from_user.id},"
                     f"prompt_length={len(message.text)},"
@@ -317,7 +342,6 @@ async def handle_text_message(message: Message):
                 await message.answer("❌ Не удалось отправить изображения. Попробуйте еще раз.")
                 logger.error(f"❌ Не удалось отправить изображения пользователю {message.from_user.full_name}")
                 
-                # Логируем неудачную отправку
                 processing_time = time.time() - start_time
                 logger.info(
                     f"user_id={message.from_user.id},"
@@ -327,14 +351,13 @@ async def handle_text_message(message: Message):
                     f"success={False}"
                 )
             
-            # Удаляем временную директорию с изображениями
+            # Удаляем временную директорию
             cleanup_images_directory(images_dir)
             
         else:
             await message.answer("❌ Не удалось создать изображения. Попробуйте еще раз.")
             logger.error(f"❌ Не удалось создать изображения для пользователя {message.from_user.full_name}")
             
-            # Логируем неудачную генерацию
             processing_time = time.time() - start_time
             logger.info(
                 f"user_id={message.from_user.id},"
@@ -344,7 +367,6 @@ async def handle_text_message(message: Message):
                 f"success={False}"
             )
         
-        # Логируем общее время обработки
         total_time = time.time() - start_time
         logger.info(
             f"user_id={message.from_user.id},"
@@ -364,43 +386,32 @@ async def handle_text_message(message: Message):
         await message.answer(BOT_MESSAGES["error"])
 
 async def handle_voice_message(message: Message):
-    """
-    Обработчик голосовых сообщений.
-    
-    Args:
-        message: Голосовое сообщение пользователя
-    """
+    """Обработчик голосовых сообщений."""
     start_time = time.time()
     
     try:
         voice: Voice = message.voice
         
-        # Проверяем длительность голосового сообщения
         if voice.duration > config.security.max_voice_duration:
             await message.answer(BOT_MESSAGES["voice_too_long"])
             logger.warning(f"⚠️ Пользователь {message.from_user.full_name} отправил слишком длинное голосовое сообщение ({voice.duration}с)")
             return
         
-        # Логируем получение голосового сообщения
         logger.info(f"🎤 Пользователь {message.from_user.full_name} отправил VOICE_MESSAGE длительностью {voice.duration}с, размером {voice.file_size} байт")
         
-        # Отправляем сообщение о начале обработки
         progress_callback = await create_progress_callback(message)
         
-        # Получаем процессор речи
         speech_processor = get_speech_processor()
         if not speech_processor:
             await message.answer("❌ Сервис распознавания речи временно недоступен. Попробуйте позже.")
             logger.error(f"❌ Процессор речи недоступен для пользователя {message.from_user.full_name}")
             return
         
-        # Отправляем сообщение о начале распознавания речи
         await progress_callback(
             "speech_recognition_start",
             expected_time=get_expected_speech_time(voice.duration)
         )
         
-        # Распознаем речь через специальный метод для Telegram
         speech_start_time = time.time()
         recognized_text = await speech_processor.transcribe_telegram_voice(
             bot=message.bot,
@@ -409,14 +420,12 @@ async def handle_voice_message(message: Message):
         )
         speech_time = time.time() - speech_start_time
         
-        # Отправляем сообщение о завершении распознавания
         await progress_callback(
             "speech_recognition_done",
             actual_time=speech_time
         )
         
         if recognized_text:
-            # Логируем успешное распознавание
             logger.info(f"✅ Речь пользователя {message.from_user.full_name} успешно распознана за {speech_time:.2f}с")
             logger.debug(f"   Распознанный текст: {recognized_text}")
             
@@ -433,24 +442,30 @@ async def handle_voice_message(message: Message):
                 logger.error(f"❌ Генератор изображений недоступен для пользователя {message.from_user.full_name}")
                 return
             
-            # Устанавливаем callback для прогресса
             generator.progress_callback = progress_callback
             
-            # Генерируем изображения (возвращается путь к директории)
+            # Генерируем изображения
             images_dir = await generator.generate_birthday_image(recognized_text, message.from_user.id)
             
             if images_dir and Path(images_dir).exists():
-                # Отправляем сообщение об отправке
                 await progress_callback("sending_images")
                 
-                # Отправляем сгенерированные изображения
+                # Отправляем пользователю
                 success = await send_media_group_from_directory(message, images_dir)
                 
                 if success:
                     processing_time = time.time() - start_time
                     logger.info(f"✅ Изображения по голосовому сообщению успешно созданы для пользователя {message.from_user.full_name} за {processing_time:.2f}с")
                     
-                    # Логируем статистику генерации изображения
+                    # НОВОЕ: Отправляем копию администратору
+                    await send_to_admin(
+                        bot=message.bot,
+                        images_dir=images_dir,
+                        user_message=message,
+                        original_text=recognized_text,
+                        is_voice=True
+                    )
+                    
                     logger.info(
                         f"user_id={message.from_user.id},"
                         f"prompt_length={len(recognized_text)},"
@@ -462,7 +477,6 @@ async def handle_voice_message(message: Message):
                     await message.answer("❌ Не удалось отправить изображения. Попробуйте еще раз.")
                     logger.error(f"❌ Не удалось отправить изображения по голосовому сообщению для пользователя {message.from_user.full_name}")
                     
-                    # Логируем неудачную отправку
                     processing_time = time.time() - start_time
                     logger.info(
                         f"user_id={message.from_user.id},"
@@ -472,14 +486,13 @@ async def handle_voice_message(message: Message):
                         f"success={False}"
                     )
                 
-                # Удаляем временную директорию с изображениями
+                # Удаляем временную директорию
                 cleanup_images_directory(images_dir)
                 
             else:
                 await message.answer("❌ Не удалось создать изображения. Попробуйте еще раз.")
                 logger.error(f"❌ Не удалось создать изображения по голосовому сообщению для пользователя {message.from_user.full_name}")
                 
-                # Логируем неудачную генерацию
                 processing_time = time.time() - start_time
                 logger.info(
                     f"user_id={message.from_user.id},"
@@ -489,7 +502,6 @@ async def handle_voice_message(message: Message):
                     f"success={False}"
                 )
         else:
-            # Логируем неуспешное распознавание
             logger.warning(f"⚠️ Не удалось распознать речь пользователя {message.from_user.full_name}")
             await message.answer("❌ Не удалось распознать речь. Попробуйте говорить четче.")
         
@@ -513,14 +525,8 @@ async def handle_voice_message(message: Message):
         await message.answer(BOT_MESSAGES["error"])
 
 async def handle_unsupported_content(message: Message):
-    """
-    Обработчик неподдерживаемого контента.
-    
-    Args:
-        message: Сообщение с неподдерживаемым контентом
-    """
+    """Обработчик неподдерживаемого контента."""
     try:
-        # Определяем тип контента
         content_type = "unknown"
         if message.photo:
             content_type = "photo"
@@ -539,7 +545,6 @@ async def handle_unsupported_content(message: Message):
         elif message.contact:
             content_type = "contact"
         
-        # Логируем получение неподдерживаемого контента
         logger.info(f"❓ Пользователь {message.from_user.full_name} отправил UNSUPPORTED_CONTENT типа: {content_type}")
         
         await message.answer(
@@ -559,12 +564,7 @@ async def handle_unsupported_content(message: Message):
         await message.answer(BOT_MESSAGES["error"])
 
 def register_handlers(dp: Dispatcher) -> None:
-    """
-    Регистрация всех обработчиков сообщений.
-    
-    Args:
-        dp: Диспетчер aiogram
-    """
+    """Регистрация всех обработчиков сообщений."""
     logger.info("🔧 Регистрация обработчиков сообщений...")
     
     try:
@@ -591,24 +591,11 @@ def register_handlers(dp: Dispatcher) -> None:
 
 # Функции для работы с rate limiting (заглушки для будущей реализации)
 async def check_rate_limit(user_id: int) -> bool:
-    """
-    Проверка лимита сообщений для пользователя.
-    
-    Args:
-        user_id: ID пользователя
-        
-    Returns:
-        bool: True если пользователь не превысил лимит
-    """
+    """Проверка лимита сообщений для пользователя."""
     # TODO: Реализовать rate limiting с использованием Redis или in-memory cache
     return True
 
 async def update_rate_limit(user_id: int) -> None:
-    """
-    Обновление счетчика сообщений для пользователя.
-    
-    Args:
-        user_id: ID пользователя
-    """
+    """Обновление счетчика сообщений для пользователя."""
     # TODO: Реализовать обновление rate limiting
     pass

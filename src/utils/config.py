@@ -20,6 +20,7 @@ load_dotenv()
 class BotConfig:
     """Конфигурация Telegram бота."""
     token: str = ""
+    admin_user_id: Optional[int] = None  # ID администратора для получения копий результатов
 
 @dataclass
 class SpeechConfig:
@@ -171,6 +172,8 @@ class Config:
         if (bot_config := data.get("bot")) is not None:
             if (token := bot_config.get("token")) is not None:
                 self.bot.token = token
+            if (admin_user_id := bot_config.get("admin_user_id")) is not None:
+                self.bot.admin_user_id = int(admin_user_id)
 
         # Speech configuration
         if (speech_config := data.get("speech")) is not None:
@@ -433,6 +436,7 @@ class Config:
         """
         return {
             "bot_token_configured": bool(self.bot.token and self.bot.token != "YOUR_TELEGRAM_BOT_TOKEN_HERE"),
+            "bot_admin_user_id": self.bot.admin_user_id,
             "diffusion_model": self.diffusion.model,
             "diffusion_device": self.diffusion.device,
             "diffusion_num_images": self.diffusion.num_images,
