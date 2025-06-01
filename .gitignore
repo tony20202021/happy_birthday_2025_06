@@ -1,0 +1,365 @@
+# Birthday Bot .gitignore
+
+# ==========================================
+# СЕКРЕТНЫЕ ФАЙЛЫ И КОНФИГУРАЦИЯ
+# ==========================================
+# Файлы с токенами и секретами
+.env
+.env.local
+.env.production
+.env.staging
+secrets.yaml
+
+# SSH ключи и конфигурации
+.ssh/
+id_rsa*
+id_ed25519*
+
+# ==========================================
+# ВРЕМЕННЫЕ ФАЙЛЫ ПРОЕКТА
+# ==========================================
+# Временные аудиофайлы
+temp/audio/*
+!temp/audio/.gitkeep
+
+# Временные изображения
+temp/images/*
+!temp/images/.gitkeep
+
+# Общая временная директория
+temp/*
+!temp/.gitkeep
+!temp/*/
+!temp/*/.gitkeep
+
+# Кэш файлы
+cache/
+*.cache
+
+# ==========================================
+# ЛОГИ И МОНИТОРИНГ
+# ==========================================
+# Все файлы логов
+logs/
+
+# Системные логи
+*.log
+*.log.*
+nohup.out
+
+# ==========================================
+# PYTHON ФАЙЛЫ
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# Pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# ==========================================
+# МОДЕЛИ МАШИННОГО ОБУЧЕНИЯ
+# ==========================================
+# Whisper модели (кэш)
+~/.cache/whisper/
+.cache/whisper/
+whisper_cache/
+
+# Hugging Face кэш
+~/.cache/huggingface/
+.cache/huggingface/
+huggingface_cache/
+
+# PyTorch модели
+*.pth
+*.pt
+*.ckpt
+models/
+checkpoints/
+
+# TensorFlow модели
+*.pb
+*.h5
+saved_model/
+
+# ==========================================
+# CONDA И ВИРТУАЛЬНЫЕ ОКРУЖЕНИЯ
+# ==========================================
+# Conda окружения
+envs/
+.conda/
+conda-meta/
+
+# Virtualenv
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Virtualenvwrapper
+.virtualenvs/
+
+# ==========================================
+# РАЗРАБОТКА И IDE
+# ==========================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ==========================================
+# ОПЕРАЦИОННЫЕ СИСТЕМЫ
+# ==========================================
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ==========================================
+# АРХИВЫ И БЭКАПЫ
+# ==========================================
+# Архивы проекта
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.rar
+
+# Бэкапы
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+*~
+
+# ==========================================
+# СЕТЕВЫЕ И ВРЕМЕННЫЕ ФАЙЛЫ
+# ==========================================
+# Веб-серверы
+.htaccess
+.htpasswd
+
+# Certificates
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# ==========================================
+# DOCKER И КОНТЕЙНЕРИЗАЦИЯ
+# ==========================================
+# Docker
+.docker/
+docker-compose.override.yml
+.dockerignore
+
+# ==========================================
+# ПРОЦЕССЫ И СИСТЕМНЫЕ ФАЙЛЫ
+# ==========================================
+# PID файлы
+*.pid
+*.pid.lock
+
+# Socket файлы
+*.sock
+
+# Systemd
+*.service.d/
+
+# ==========================================
+# СПЕЦИФИЧНЫЕ ДЛЯ BIRTHDAY BOT
+# ==========================================
+# Пользовательские голосовые файлы
+voice_*.ogg
+voice_*.mp3
+voice_*.wav
+voice_*.m4a
+
+# Сгенерированные изображения
+birthday_*.png
+birthday_*.jpg
+birthday_*.jpeg
+
+# Статистика и метрики
+stats.json
+metrics.json
+usage.log
+
+# Экспорты данных
+export_*.csv
+export_*.json
+data_dump_*
+
+# Конфигурации разработчика
+local_config.py
+dev_settings.py
+test_config.yaml
+
+# ==========================================
+# ИСКЛЮЧЕНИЯ (ФАЙЛЫ ДЛЯ ВКЛЮЧЕНИЯ)
+# ==========================================
+# Сохраняем структуру проекта
+!src/
+!docs/
+!requirements.txt
+!environment.yml
+!Makefile
+!setup.py
+!setup.sh
+!run_bot.py
+!README.md
+!.env.example
+
+# Сохраняем .gitkeep файлы для пустых директорий
+!.gitkeep
+!**/.gitkeep
+
+# Сохраняем примеры конфигурации
+!docs/examples/
+!*.example
+!*_example.*
+
+# Важные файлы проекта
+!LICENSE
+!CHANGELOG.md
+!CONTRIBUTING.md
