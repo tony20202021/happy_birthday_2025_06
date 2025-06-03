@@ -13,7 +13,20 @@ diffusion:
   model: "black-forest-labs/FLUX.1-schnell"
   
   # Устройство для генерации: auto, cpu, cuda, mps
+  # auto - автоматическое определение всех доступных GPU
   device: "auto"
+  
+  # Список GPU устройств для multi-GPU генерации
+  # Если пустой - будет автоматически определен при device: "auto"
+  # Примеры:
+  # gpu_devices: ["cuda:0", "cuda:1", "cuda:2"]  # 3 GPU
+  # gpu_devices: ["cuda:0"]                      # 1 GPU
+  # gpu_devices: ["cpu"]                         # только CPU
+  gpu_devices: []
+  
+  # Максимальный размер очереди ожидания генерации
+  # Если все GPU заняты, пользователи ждут в очереди
+  max_queue_size: 10
   
   # Размер генерируемых изображений
   width: 1024
@@ -173,3 +186,4 @@ production:
   
   # Мониторинг производительности
   performance_monitoring: true
+  

@@ -1,5 +1,6 @@
 """
-Обновленный модуль обработчиков с функционалом отправки копий администратору.
+Обновленный модуль обработчиков с функционалом отправки копий администратору
+и поддержкой multi-GPU генерации.
 """
 
 import asyncio
@@ -26,6 +27,11 @@ logger = get_handlers_logger()
 # Инициализация модулей (будут созданы при первом использовании)
 speech_processor = None
 image_generator = None
+
+# Исключение для случая когда все GPU заняты
+class AllGPUsBusyError(Exception):
+    """Исключение когда все GPU заняты и очередь переполнена."""
+    pass
 
 def get_speech_processor():
     """Получение экземпляра обработчика речи (lazy initialization)."""
@@ -260,6 +266,133 @@ def cleanup_images_directory(images_dir: str) -> None:
     except Exception as e:
         logger.warning(f"⚠️ Не удалось удалить директорию {images_dir}: {e}")
 
+async def handle_generation_request(message: Message, text: str, is_voice: bool = False):
+    """
+    Общий обработчик для генерации изображений с поддержкой multi-GPU.
+    
+    Args:
+        message: Сообщение пользователя
+        text: Текст для генерации
+        is_voice: Было ли исходное сообщение голосовым
+    """
+    start_time = time.time()
+    
+    try:
+        progress_callback = await create_progress_callback(message)
+        
+        generator = get_image_generator()
+        if not generator:
+            await message.answer("❌ Сервис генерации изображений временно недоступен. Попробуйте позже.")
+            logger.error(f"❌ Генератор изображений недоступен для пользователя {message.from_user.full_name}")
+            return
+        
+        generator.progress_callback = progress_callback
+        
+        # Проверяем статус GPU пула
+        gpu_status = generator.gpu_pool.get_status()
+        logger.debug(f"🎮 GPU статус: {gpu_status}")
+        
+        # Если очередь переполнена - уведомляем пользователя
+        if gpu_status["queue_size"] >= config.diffusion.max_queue_size:
+            await message.answer(
+                f"⚠️ Слишком много запросов! Попробуйте через несколько минут.\n"
+                f"Очередь: {gpu_status['queue_size']}/{config.diffusion.max_queue_size}"
+            )
+            logger.warning(f"⚠️ Очередь переполнена для пользователя {message.from_user.full_name}")
+            return
+        
+        # Уведомляем о позиции в очереди если есть ожидание
+        if gpu_status["available_gpus"] == 0:
+            queue_position = gpu_status["queue_size"] + 1
+            await message.answer(
+                f"⏳ Все GPU заняты. Ваша позиция в очереди: {queue_position}\n"
+                f"Активных GPU: {gpu_status['busy_gpus']}/{gpu_status['total_gpus']}"
+            )
+        
+        # Генерируем изображения (может ждать в очереди)
+        images_dir = await generator.generate_birthday_image(text, message.from_user.id)
+        
+        if images_dir and Path(images_dir).exists():
+            await progress_callback("sending_images")
+            
+            # Отправляем пользователю
+            success = await send_media_group_from_directory(message, images_dir)
+            
+            if success:
+                processing_time = time.time() - start_time
+                logger.info(f"✅ Изображения успешно сгенерированы и отправлены пользователю {message.from_user.full_name} за {processing_time:.2f}с")
+                
+                # Отправляем копию администратору
+                await send_to_admin(
+                    bot=message.bot,
+                    images_dir=images_dir,
+                    user_message=message,
+                    original_text=text,
+                    is_voice=is_voice
+                )
+                
+                logger.info(
+                    f"user_id={message.from_user.id},"
+                    f"prompt_length={len(text)},"
+                    f"generation_time={processing_time},"
+                    f"num_images={config.diffusion.num_images},"
+                    f"success={True}"
+                )
+            else:
+                await message.answer("❌ Не удалось отправить изображения. Попробуйте еще раз.")
+                logger.error(f"❌ Не удалось отправить изображения пользователю {message.from_user.full_name}")
+                
+                processing_time = time.time() - start_time
+                logger.info(
+                    f"user_id={message.from_user.id},"
+                    f"prompt_length={len(text)},"
+                    f"generation_time={processing_time},"
+                    f"num_images={config.diffusion.num_images},"
+                    f"success={False}"
+                )
+            
+            # Удаляем временную директорию
+            cleanup_images_directory(images_dir)
+            
+        else:
+            await message.answer("❌ Не удалось создать изображения. Попробуйте еще раз.")
+            logger.error(f"❌ Не удалось создать изображения для пользователя {message.from_user.full_name}")
+            
+            processing_time = time.time() - start_time
+            logger.info(
+                f"user_id={message.from_user.id},"
+                f"prompt_length={len(text)},"
+                f"generation_time={processing_time},"
+                f"num_images={config.diffusion.num_images},"
+                f"success={False}"
+            )
+        
+        total_time = time.time() - start_time
+        logger.info(
+            f"user_id={message.from_user.id},"
+            f"message_type={'voice' if is_voice else 'text'},"
+            f"processing_time={total_time}"
+        )
+        
+    except asyncio.QueueFull:
+        # Очередь переполнена
+        await message.answer(
+            "⚠️ Слишком много запросов! Все GPU заняты, очередь переполнена.\n"
+            "Попробуйте через несколько минут."
+        )
+        logger.warning(f"⚠️ Очередь GPU переполнена для пользователя {message.from_user.full_name}")
+        
+    except Exception as e:
+        logger.error(
+            f"error={e},"
+            f"context={{"
+            f'"method": "handle_generation_request",'
+            f'"user_id": {message.from_user.id},'
+            f'"text_length": {len(text) if text else 0}'
+            f"}}"
+        )
+        await message.answer(BOT_MESSAGES["error"])
+
 async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start."""
     try:
@@ -292,87 +425,13 @@ async def cmd_help(message: Message):
 
 async def handle_text_message(message: Message):
     """Обработчик текстовых сообщений."""
-    start_time = time.time()
-    
     try:
         text_preview = message.text[:50] + "..." if len(message.text) > 50 else message.text
         logger.info(f"📝 Пользователь {message.from_user.full_name} отправил TEXT_MESSAGE длиной {len(message.text)} символов")
         logger.debug(f"   Текст: {text_preview}")
         
-        progress_callback = await create_progress_callback(message)
-        
-        generator = get_image_generator()
-        if not generator:
-            await message.answer("❌ Сервис генерации изображений временно недоступен. Попробуйте позже.")
-            logger.error(f"❌ Генератор изображений недоступен для пользователя {message.from_user.full_name}")
-            return
-        
-        generator.progress_callback = progress_callback
-        
-        # Генерируем изображения
-        images_dir = await generator.generate_birthday_image(message.text, message.from_user.id)
-        
-        if images_dir and Path(images_dir).exists():
-            await progress_callback("sending_images")
-            
-            # Отправляем пользователю
-            success = await send_media_group_from_directory(message, images_dir)
-            
-            if success:
-                processing_time = time.time() - start_time
-                logger.info(f"✅ Изображения успешно сгенерированы и отправлены пользователю {message.from_user.full_name} за {processing_time:.2f}с")
-                
-                # НОВОЕ: Отправляем копию администратору
-                await send_to_admin(
-                    bot=message.bot,
-                    images_dir=images_dir,
-                    user_message=message,
-                    original_text=message.text,
-                    is_voice=False
-                )
-                
-                logger.info(
-                    f"user_id={message.from_user.id},"
-                    f"prompt_length={len(message.text)},"
-                    f"generation_time={processing_time},"
-                    f"num_images={config.diffusion.num_images},"
-                    f"success={True}"
-                )
-            else:
-                await message.answer("❌ Не удалось отправить изображения. Попробуйте еще раз.")
-                logger.error(f"❌ Не удалось отправить изображения пользователю {message.from_user.full_name}")
-                
-                processing_time = time.time() - start_time
-                logger.info(
-                    f"user_id={message.from_user.id},"
-                    f"prompt_length={len(message.text)},"
-                    f"generation_time={processing_time},"
-                    f"num_images={config.diffusion.num_images},"
-                    f"success={False}"
-                )
-            
-            # Удаляем временную директорию
-            cleanup_images_directory(images_dir)
-            
-        else:
-            await message.answer("❌ Не удалось создать изображения. Попробуйте еще раз.")
-            logger.error(f"❌ Не удалось создать изображения для пользователя {message.from_user.full_name}")
-            
-            processing_time = time.time() - start_time
-            logger.info(
-                f"user_id={message.from_user.id},"
-                f"prompt_length={len(message.text)},"
-                f"generation_time={processing_time},"
-                f"num_images={config.diffusion.num_images},"
-                f"success={False}"
-            )
-        
-        total_time = time.time() - start_time
-        logger.info(
-            f"user_id={message.from_user.id},"
-            f"message_type=text,"
-            f"processing_time={total_time}"
-        )
+        # Используем общий обработчик
+        await handle_generation_request(message, message.text, is_voice=False)
         
     except Exception as e:
         logger.error(
@@ -435,72 +494,8 @@ async def handle_voice_message(message: Message):
                 parse_mode="HTML"
             )
             
-            # Генерируем изображения на основе распознанного текста
-            generator = get_image_generator()
-            if not generator:
-                await message.answer("❌ Сервис генерации изображений временно недоступен.")
-                logger.error(f"❌ Генератор изображений недоступен для пользователя {message.from_user.full_name}")
-                return
-            
-            generator.progress_callback = progress_callback
-            
-            # Генерируем изображения
-            images_dir = await generator.generate_birthday_image(recognized_text, message.from_user.id)
-            
-            if images_dir and Path(images_dir).exists():
-                await progress_callback("sending_images")
-                
-                # Отправляем пользователю
-                success = await send_media_group_from_directory(message, images_dir)
-                
-                if success:
-                    processing_time = time.time() - start_time
-                    logger.info(f"✅ Изображения по голосовому сообщению успешно созданы для пользователя {message.from_user.full_name} за {processing_time:.2f}с")
-                    
-                    # НОВОЕ: Отправляем копию администратору
-                    await send_to_admin(
-                        bot=message.bot,
-                        images_dir=images_dir,
-                        user_message=message,
-                        original_text=recognized_text,
-                        is_voice=True
-                    )
-                    
-                    logger.info(
-                        f"user_id={message.from_user.id},"
-                        f"prompt_length={len(recognized_text)},"
-                        f"generation_time={processing_time - speech_time},"
-                        f"num_images={config.diffusion.num_images},"
-                        f"success={True}"
-                    )
-                else:
-                    await message.answer("❌ Не удалось отправить изображения. Попробуйте еще раз.")
-                    logger.error(f"❌ Не удалось отправить изображения по голосовому сообщению для пользователя {message.from_user.full_name}")
-                    
-                    processing_time = time.time() - start_time
-                    logger.info(
-                        f"user_id={message.from_user.id},"
-                        f"prompt_length={len(recognized_text)},"
-                        f"generation_time={processing_time - speech_time},"
-                        f"num_images={config.diffusion.num_images},"
-                        f"success={False}"
-                    )
-                
-                # Удаляем временную директорию
-                cleanup_images_directory(images_dir)
-                
-            else:
-                await message.answer("❌ Не удалось создать изображения. Попробуйте еще раз.")
-                logger.error(f"❌ Не удалось создать изображения по голосовому сообщению для пользователя {message.from_user.full_name}")
-                
-                processing_time = time.time() - start_time
-                logger.info(
-                    f"user_id={message.from_user.id},"
-                    f"prompt_length={len(recognized_text)},"
-                    f"generation_time={processing_time - speech_time},"
-                    f"num_images={config.diffusion.num_images},"
-                    f"success={False}"
-                )
+            # Используем общий обработчик для генерации
+            await handle_generation_request(message, recognized_text, is_voice=True)
         else:
             logger.warning(f"⚠️ Не удалось распознать речь пользователя {message.from_user.full_name}")
             await message.answer("❌ Не удалось распознать речь. Попробуйте говорить четче.")

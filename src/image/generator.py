@@ -1,6 +1,7 @@
 """
 Модуль генерации изображений с использованием локальных Stable Diffusion моделей.
 Создает поздравительные картинки на основе текста с AI-генерацией.
+Поддержка multi-GPU для параллельной генерации.
 """
 
 import asyncio
@@ -9,8 +10,9 @@ import gc
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from PIL import Image, ImageDraw, ImageFont
+from contextlib import asynccontextmanager
 
 from src.utils.config import config
 from src.utils.logger import get_image_logger
@@ -18,6 +20,214 @@ from transformers import MarianMTModel, MarianTokenizer
 
 # Инициализация логгера
 logger = get_image_logger()
+
+class GPUPool:
+    """Пул GPU для параллельной генерации изображений."""
+    
+    def __init__(self, gpu_devices: List[str]):
+        """
+        Инициализация пула GPU.
+        
+        Args:
+            gpu_devices: Список GPU устройств
+        """
+        self.gpu_devices = gpu_devices
+        self.pipelines: Dict[str, Any] = {}
+        self.available_gpus = asyncio.Queue(maxsize=len(gpu_devices))
+        self.generation_queue = asyncio.Queue(maxsize=config.diffusion.max_queue_size)
+        self._initialized = False
+        
+        logger.info(f"🎮 Инициализирован GPU пул с {len(gpu_devices)} устройствами: {gpu_devices}")
+    
+    async def initialize(self):
+        """Инициализация всех pipeline для GPU."""
+        if self._initialized:
+            return
+        
+        logger.info("📥 Загрузка моделей на все GPU...")
+        
+        for device in self.gpu_devices:
+            try:
+                pipeline = await self._load_pipeline_for_device(device)
+                if pipeline:
+                    self.pipelines[device] = pipeline
+                    await self.available_gpus.put(device)
+                    logger.info(f"✅ Pipeline загружен для {device}")
+                else:
+                    logger.error(f"❌ Не удалось загрузить pipeline для {device}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки pipeline для {device}: {e}")
+        
+        self._initialized = True
+        logger.info(f"🚀 GPU пул инициализирован с {len(self.pipelines)} активными устройствами")
+    
+    async def _load_pipeline_for_device(self, device: str):
+        """Загрузка pipeline для конкретного устройства."""
+        try:
+            import torch
+            from diffusers import (
+                StableDiffusionXLPipeline, 
+                StableDiffusionPipeline,
+                DiffusionPipeline
+            )
+            
+            model_name = config.diffusion.model
+            
+            # Определяем тип pipeline по названию модели
+            if "flux" in model_name.lower():
+                try:
+                    from diffusers import FluxPipeline
+                    pipeline_class = FluxPipeline
+                    
+                    load_kwargs = {
+                        "torch_dtype": torch.bfloat16 if device != "cpu" else torch.float32,
+                    }
+                    
+                    pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
+                    
+                except ImportError:
+                    logger.error(f"❌ FluxPipeline не найден для {device}")
+                    return None
+                    
+            elif "xl" in model_name.lower():
+                pipeline_class = StableDiffusionXLPipeline
+                
+                load_kwargs = {
+                    "torch_dtype": torch.float16 if device != "cpu" else torch.float32,
+                    "safety_checker": None,
+                    "requires_safety_checker": False
+                }
+                
+                if device != "cpu":
+                    load_kwargs["variant"] = "fp16"
+                
+                pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
+                
+            elif "stable-diffusion" in model_name.lower():
+                pipeline_class = StableDiffusionPipeline
+                
+                load_kwargs = {
+                    "torch_dtype": torch.float16 if device != "cpu" else torch.float32,
+                    "safety_checker": None,
+                    "requires_safety_checker": False
+                }
+                
+                if device != "cpu":
+                    load_kwargs["variant"] = "fp16"
+                
+                pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
+                
+            else:
+                pipeline_class = DiffusionPipeline
+                
+                load_kwargs = {
+                    "torch_dtype": torch.float16 if device != "cpu" else torch.float32,
+                }
+                
+                pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
+            
+            # Перемещаем на устройство
+            pipeline = pipeline.to(device)
+            
+            # Применяем оптимизации
+            self._apply_optimizations(pipeline, device)
+            
+            return pipeline
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки pipeline для {device}: {e}")
+            return None
+    
+    def _apply_optimizations(self, pipeline, device: str):
+        """Применение оптимизаций для конкретного устройства."""
+        try:
+            if device.startswith("cuda"):
+                if hasattr(pipeline, 'enable_memory_efficient_attention'):
+                    pipeline.enable_memory_efficient_attention()
+                    
+                if config.diffusion.enable_xformers:
+                    try:
+                        pipeline.enable_xformers_memory_efficient_attention()
+                    except Exception:
+                        pass
+                        
+                if config.diffusion.enable_cpu_offload:
+                    pipeline.enable_model_cpu_offload()
+                    
+            elif device == "mps":
+                if hasattr(pipeline, 'enable_attention_slicing'):
+                    pipeline.enable_attention_slicing()
+                    
+            else:  # CPU
+                if hasattr(pipeline, 'enable_attention_slicing'):
+                    pipeline.enable_attention_slicing()
+                    
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка применения оптимизаций для {device}: {e}")
+    
+    @asynccontextmanager
+    async def acquire_gpu(self):
+        """Контекстный менеджер для получения GPU из пула."""
+        if not self._initialized:
+            await self.initialize()
+        
+        # Ждем свободную GPU
+        device = await self.available_gpus.get()
+        pipeline = self.pipelines.get(device)
+        
+        if not pipeline:
+            await self.available_gpus.put(device)
+            raise RuntimeError(f"Pipeline для {device} недоступен")
+        
+        try:
+            logger.debug(f"🔒 Получен доступ к {device}")
+            yield device, pipeline
+        finally:
+            # Очищаем память и возвращаем GPU в пул
+            self._cleanup_device_memory(device)
+            await self.available_gpus.put(device)
+            logger.debug(f"🔓 Освобожден {device}")
+    
+    def _cleanup_device_memory(self, device: str):
+        """Очистка памяти конкретного устройства."""
+        try:
+            import torch
+            
+            if device.startswith("cuda"):
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            elif device == "mps":
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+            
+            gc.collect()
+            
+        except Exception as e:
+            logger.debug(f"Ошибка очистки памяти {device}: {e}")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Получение статуса пула GPU."""
+        return {
+            "total_gpus": len(self.gpu_devices),
+            "available_gpus": self.available_gpus.qsize(),
+            "busy_gpus": len(self.gpu_devices) - self.available_gpus.qsize(),
+            "queue_size": self.generation_queue.qsize(),
+            "max_queue_size": config.diffusion.max_queue_size,
+            "initialized": self._initialized
+        }
+
+# Глобальный пул GPU (синглтон)
+_gpu_pool: Optional[GPUPool] = None
+
+def get_gpu_pool() -> GPUPool:
+    """Получение глобального пула GPU."""
+    global _gpu_pool
+    if _gpu_pool is None:
+        gpu_devices = config.diffusion.gpu_devices
+        if not gpu_devices:
+            gpu_devices = ["cpu"]  # Fallback
+        _gpu_pool = GPUPool(gpu_devices)
+    return _gpu_pool
 
 class ImageGenerator:
     """Генератор поздравительных изображений с локальными AI моделями."""
@@ -29,69 +239,17 @@ class ImageGenerator:
         Args:
             progress_callback: Функция для отправки сообщений о прогрессе
         """
-        self.device = None
-        self.pipeline = None
-        self.model_loaded = False
         self.progress_callback = progress_callback
+        self.gpu_pool = get_gpu_pool()
         
-        logger.info("🎨 Инициализирован локальный генератор изображений")
+        logger.info("🎨 Инициализирован multi-GPU генератор изображений")
         logger.info(f"   Модель: {config.diffusion.model}")
         logger.info(f"   Количество изображений: {config.diffusion.num_images}")
-        
-        # Инициализируем устройство
-        self.device = self._get_device()
-        logger.info(f"   Устройство: {self.device}")
+        logger.info(f"   GPU устройства: {config.diffusion.gpu_devices}")
         
         # Проверяем зависимости
         if not self._check_dependencies():
             raise ImportError("Не установлены необходимые зависимости для локальной генерации изображений")
-
-    def _get_device(self):
-        """Определение оптимального устройства для вычислений."""
-        try:
-            import torch
-        except ImportError:
-            logger.error("❌ PyTorch не установлен")
-            return "cpu"
-            
-        if config.diffusion.device == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-                try:
-                    device_name = torch.cuda.get_device_name(0)
-                    logger.info(f"🚀 Обнаружена CUDA GPU: {device_name}")
-                except:
-                    logger.info("🚀 CUDA доступна")
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = "mps"
-                logger.info("🍎 Использование Apple Silicon GPU (MPS)")
-            else:
-                device = "cpu"
-                logger.info("💻 Использование CPU")
-        else:
-            device = config.diffusion.device
-            
-        return device
-
-    def _get_expected_model_load_time(self) -> int:
-        """Получение ожидаемого времени загрузки модели в секундах."""
-        model_name = config.diffusion.model.lower()
-        
-        if "flux" in model_name:
-            if self.device == "cuda":
-                return 15  # FLUX на GPU
-            else:
-                return 40  # FLUX на CPU
-        elif "xl" in model_name:
-            if self.device == "cuda":
-                return 30  # SDXL на GPU
-            else:
-                return 90   # SDXL на CPU
-        else:
-            if self.device == "cuda":
-                return 20   # SD на GPU
-            else:
-                return 60   # SD на CPU
 
     def _get_expected_translation_time(self) -> int:
         """Получение ожидаемого времени перевода текста в секундах."""
@@ -103,25 +261,16 @@ class ImageGenerator:
         num_images = config.diffusion.num_images
         steps = config.diffusion.num_inference_steps
         
-        # Базовое время на одно изображение
+        # Базовое время на одно изображение (для одной GPU)
         if "flux" in model_name:
-            if self.device == "cuda":
-                base_time = 12  # FLUX на GPU - быстрее
-            else:
-                base_time = 50  # FLUX на CPU
+            base_time = 12  # FLUX быстрее
         elif "xl" in model_name:
-            if self.device == "cuda":
-                base_time = 8   # SDXL на GPU
-            else:
-                base_time = 45  # SDXL на CPU
+            base_time = 8   # SDXL
         else:
-            if self.device == "cuda":
-                base_time = 5   # SD на GPU
-            else:
-                base_time = 30  # SD на CPU
+            base_time = 5   # SD
         
-        # Учитываем количество шагов и изображений
-        time_per_image = base_time * (steps / 20)  # Нормализуем к 20 шагам
+        # Учитываем количество шагов
+        time_per_image = base_time * (steps / 20)
         total_time = time_per_image * num_images
         
         return int(total_time)
@@ -148,7 +297,7 @@ class ImageGenerator:
 
     async def generate_birthday_image(self, text: str, user_id: int) -> Optional[str]:
         """
-        Генерация поздравительных картинок.
+        Генерация поздравительных картинок с использованием GPU пула.
         
         Args:
             text: Текст поздравления
@@ -166,7 +315,12 @@ class ImageGenerator:
             output_dir = config.create_temp_images_dir(user_id)
             logger.info(f"📁 Создана временная директория: {output_dir}")
             
-            images = await self._generate_with_diffusion(text)
+            # Инициализируем пул если нужно
+            if not self.gpu_pool._initialized and config.diffusion.preload_model:
+                await self.gpu_pool.initialize()
+            
+            # Генерируем изображения с использованием GPU пула
+            images = await self._generate_with_gpu_pool(text)
             
             if images and len(images) > 0:
                 # Сохраняем все изображения в директорию
@@ -186,219 +340,25 @@ class ImageGenerator:
                 if saved_paths:
                     generation_time = time.time() - start_time
                     logger.info(f"✅ Сгенерировано и сохранено {len(saved_paths)} изображений за {generation_time:.2f}с")
-                    
-                    # Очищаем память
-                    self._cleanup_memory()
-                    
                     return output_dir
                 else:
                     logger.error("❌ Не удалось сохранить ни одного изображения")
-                    # Удаляем пустую директорию
                     self._cleanup_directory(output_dir)
                     return None
             else:
                 logger.error("❌ Не удалось сгенерировать изображения")
-                # Удаляем пустую директорию
                 self._cleanup_directory(output_dir)
                 return None
                 
         except Exception as e:
-            logger.error(
-                f"error={e},"
-                f"context={{"
-                f"method: 'generate_birthday_image',"
-                f"user_id: {user_id},"
-                f"text_length: {len(text)}"
-                f"}}"
-            )
-            # Очищаем директорию при ошибке
+            logger.error(f"❌ Ошибка генерации изображений для пользователя {user_id}: {e}")
             if 'output_dir' in locals():
                 self._cleanup_directory(output_dir)
             return None
 
-    def _cleanup_directory(self, directory_path: str) -> None:
+    async def _generate_with_gpu_pool(self, text: str) -> Optional[List[Image.Image]]:
         """
-        Очистка директории и её удаление.
-        
-        Args:
-            directory_path: Путь к директории для удаления
-        """
-        try:
-            dir_path = Path(directory_path)
-            if dir_path.exists() and dir_path.is_dir():
-                shutil.rmtree(dir_path)
-                logger.debug(f"🗑️ Удалена директория: {directory_path}")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось удалить директорию {directory_path}: {e}")
-
-    async def _load_diffusion_model(self):
-        """Загрузка локальной diffusion модели."""
-        if self.model_loaded:
-            return True
-            
-        try:
-            import torch
-            from diffusers import (
-                StableDiffusionXLPipeline, 
-                StableDiffusionPipeline,
-                DiffusionPipeline
-            )
-            
-            # Отправляем сообщение о начале загрузки
-            await self._send_progress_message(
-                "model_loading_start",
-                expected_time=self._get_expected_model_load_time()
-            )
-            
-            logger.info("📥 Загрузка локальной diffusion модели...")
-            start_time = time.time()
-            
-            model_name = config.diffusion.model
-            
-            # Определяем тип pipeline по названию модели
-            if "flux" in model_name.lower():
-                logger.info("🔧 Загрузка FLUX pipeline...")
-                try:
-                    from diffusers import FluxPipeline
-                    pipeline_class = FluxPipeline
-                    
-                    # Специальные настройки для FLUX
-                    load_kwargs = {
-                        "torch_dtype": torch.bfloat16 if self.device != "cpu" else torch.float32,
-                    }
-                    
-                    # FLUX не поддерживает device_map="auto", используем обычную загрузку
-                    logger.info(f"Загрузка FLUX модели {model_name}...")
-                    self.pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
-                    
-                except ImportError as e:
-                    logger.error(f"error: {e}")
-                    logger.error(f"❌ FluxPipeline не найден. Обновите diffusers: pip install diffusers>=0.30.0")
-                    import diffusers
-                    logger.info(f"diffusers: {diffusers.__version__}")
-                    return False
-                    
-            elif "xl" in model_name.lower():
-                logger.info("🔧 Загрузка SDXL pipeline...")
-                pipeline_class = StableDiffusionXLPipeline
-                
-                # Настройки загрузки для SDXL
-                load_kwargs = {
-                    "torch_dtype": torch.float16 if self.device != "cpu" else torch.float32,
-                    "safety_checker": None,
-                    "requires_safety_checker": False
-                }
-                
-                # Добавляем variant для fp16 моделей
-                if self.device != "cpu":
-                    load_kwargs["variant"] = "fp16"
-                
-                # Загружаем модель
-                self.pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
-                
-            elif "stable-diffusion" in model_name.lower():
-                logger.info("🔧 Загрузка SD pipeline...")
-                pipeline_class = StableDiffusionPipeline
-                
-                # Настройки загрузки для SD
-                load_kwargs = {
-                    "torch_dtype": torch.float16 if self.device != "cpu" else torch.float32,
-                    "safety_checker": None,
-                    "requires_safety_checker": False
-                }
-                
-                if self.device != "cpu":
-                    load_kwargs["variant"] = "fp16"
-                
-                self.pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
-                
-            else:
-                logger.info("🔧 Загрузка универсального pipeline...")
-                pipeline_class = DiffusionPipeline
-                
-                # Настройки загрузки для универсального pipeline
-                load_kwargs = {
-                    "torch_dtype": torch.float16 if self.device != "cpu" else torch.float32,
-                }
-                
-                self.pipeline = pipeline_class.from_pretrained(model_name, **load_kwargs)
-            
-            # Перемещаем на устройство
-            self.pipeline = self.pipeline.to(self.device)
-            
-            # Применяем оптимизации
-            self._apply_optimizations()
-            
-            self.model_loaded = True
-            load_time = time.time() - start_time
-            
-            # Отправляем сообщение о завершении загрузки
-            logger.info(f"model_loading_done")
-            await self._send_progress_message(
-                "model_loading_done",
-                actual_time=load_time
-            )
-            
-            logger.info(f"✅ Локальная модель загружена за {load_time:.1f}с")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки локальной модели: {e}")
-            return False
-
-    def _apply_optimizations(self):
-        """Применение оптимизаций для разных устройств."""
-        try:
-            if self.device == "cuda":
-                # Оптимизации для CUDA
-                if hasattr(self.pipeline, 'enable_memory_efficient_attention'):
-                    self.pipeline.enable_memory_efficient_attention()
-                    
-                if config.diffusion.enable_xformers:
-                    try:
-                        self.pipeline.enable_xformers_memory_efficient_attention()
-                        logger.info("✅ Включена xformers оптимизация")
-                    except Exception:
-                        logger.warning("⚠️ xformers недоступен")
-                        
-                if config.diffusion.enable_cpu_offload:
-                    self.pipeline.enable_model_cpu_offload()
-                    logger.info("✅ Включена CPU разгрузка")
-                    
-            elif self.device == "mps":
-                # Оптимизации для Apple Silicon
-                if hasattr(self.pipeline, 'enable_attention_slicing'):
-                    self.pipeline.enable_attention_slicing()
-                    logger.info("✅ Включена attention slicing для MPS")
-                    
-            else:  # CPU
-                # Оптимизации для CPU
-                if hasattr(self.pipeline, 'enable_attention_slicing'):
-                    self.pipeline.enable_attention_slicing()
-                    logger.info("✅ Включена attention slicing для CPU")
-                    
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка применения оптимизаций: {e}")
-
-    def _cleanup_memory(self):
-        """Очистка памяти после генерации."""
-        try:
-            import torch
-            
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-            elif self.device == "mps":
-                if hasattr(torch.mps, 'empty_cache'):
-                    torch.mps.empty_cache()
-            
-            gc.collect()
-            
-        except Exception as e:
-            logger.debug(f"Ошибка очистки памяти: {e}")
-
-    async def _generate_with_diffusion(self, text: str) -> Optional[List[Image.Image]]:
-        """
-        Генерация изображений с локальной моделью diffusion.
+        Генерация изображений с использованием GPU пула.
         
         Args:
             text: Текст поздравления
@@ -406,21 +366,8 @@ class ImageGenerator:
         Returns:
             Список PIL Image или None при ошибке
         """
-        # Загружаем модель если нужно
-        if not self.model_loaded:
-            if not await self._load_diffusion_model():
-                logger.error("❌ Не удалось загрузить локальную модель")
-                return None
-        
         try:
-            # Генерируем изображения с локальной моделью
-
-            import torch
-            
-            logger.info(f"🔄 Генерация {config.diffusion.num_images} изображений с локальной моделью...")
-            
-            # Создаем промпт для генерации
-
+            # Создаем промпт
             await self._send_progress_message(
                 "translation_start",
                 expected_time=self._get_expected_translation_time()
@@ -428,7 +375,7 @@ class ImageGenerator:
             translation_start_time = time.time()
 
             prompt = self._create_birthday_prompt(text)
-            logger.info(f"📝 Промпт: {prompt}...")
+            logger.info(f"📝 Промпт: {prompt[:100]}...")
             
             translation_time = time.time() - translation_start_time
             await self._send_progress_message(
@@ -443,78 +390,71 @@ class ImageGenerator:
             )
             generation_start_time = time.time()
 
-            # Параметры генерации (разные для FLUX и других моделей)
-            if "flux" in config.diffusion.model.lower():
-                # Параметры для FLUX
-                generation_params = {
-                    "prompt": prompt,
-                    "height": config.diffusion.height,
-                    "width": config.diffusion.width,
-                    "num_inference_steps": config.diffusion.num_inference_steps,
-                    "guidance_scale": config.diffusion.guidance_scale,
-                    "num_images_per_prompt": config.diffusion.num_images,
-                }
+            # Получаем GPU из пула и генерируем
+            async with self.gpu_pool.acquire_gpu() as (device, pipeline):
+                logger.info(f"🎮 Генерация на {device}")
                 
-                # FLUX может не поддерживать negative_prompt
-                logger.debug("Генерация с FLUX моделью...")
+                # Параметры генерации
+                generation_params = self._get_generation_params(prompt)
                 
-            else:
-                # Параметры для Stable Diffusion
-                generation_params = {
-                    "prompt": prompt,
-                    "height": config.diffusion.height,
-                    "width": config.diffusion.width,
-                    "num_inference_steps": config.diffusion.num_inference_steps,
-                    "guidance_scale": config.diffusion.guidance_scale,
-                    "num_images_per_prompt": config.diffusion.num_images,
-                }
-                
-                # Добавляем негативный промпт для SD
-                if config.diffusion.negative_prompt:
-                    generation_params["negative_prompt"] = config.diffusion.negative_prompt
-            
-            # Добавляем generator для seed
-            if config.diffusion.seed >= 0:
-                generation_params["generator"] = torch.Generator().manual_seed(config.diffusion.seed)
-            
-            logger.debug(f"🎛️ Параметры: steps={generation_params['num_inference_steps']}, "
-                        f"guidance={generation_params['guidance_scale']}, "
-                        f"images={generation_params['num_images_per_prompt']}")
-            
-            # Запускаем генерацию в отдельном потоке
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                self._run_pipeline,
-                generation_params
-            )
+                # Запускаем генерацию в отдельном потоке
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    self._run_pipeline,
+                    pipeline,
+                    generation_params
+                )
 
-            generation_time = time.time() - generation_start_time
-            await self._send_progress_message(
-                "image_generation_done",
-                actual_time=generation_time
-            )
+                generation_time = time.time() - generation_start_time
+                await self._send_progress_message(
+                    "image_generation_done",
+                    actual_time=generation_time
+                )
 
-            # Получаем изображения из результата
-            if result and hasattr(result, 'images') and result.images:
-                images = result.images
-                logger.info(f"✅ Успешно сгенерировано {len(images)} изображений локально")
-                return images
-            else:
-                logger.error("❌ Не удалось получить изображения из результата")
-                return None
+                # Получаем изображения из результата
+                if result and hasattr(result, 'images') and result.images:
+                    images = result.images
+                    logger.info(f"✅ Успешно сгенерировано {len(images)} изображений на {device}")
+                    return images
+                else:
+                    logger.error("❌ Не удалось получить изображения из результата")
+                    return None
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка генерации с diffusion: {e}")
+            logger.error(f"❌ Ошибка генерации с GPU пулом: {e}")
             return None
 
-    def _run_pipeline(self, params: dict):
+    def _get_generation_params(self, prompt: str) -> dict:
+        """Получение параметров генерации."""
+        params = {
+            "prompt": prompt,
+            "height": config.diffusion.height,
+            "width": config.diffusion.width,
+            "num_inference_steps": config.diffusion.num_inference_steps,
+            "guidance_scale": config.diffusion.guidance_scale,
+            "num_images_per_prompt": config.diffusion.num_images,
+        }
+        
+        # Добавляем негативный промпт для не-FLUX моделей
+        if "flux" not in config.diffusion.model.lower():
+            if config.diffusion.negative_prompt:
+                params["negative_prompt"] = config.diffusion.negative_prompt
+        
+        # Добавляем generator для seed
+        if config.diffusion.seed >= 0:
+            import torch
+            params["generator"] = torch.Generator().manual_seed(config.diffusion.seed)
+        
+        return params
+
+    def _run_pipeline(self, pipeline, params: dict):
         """Запуск pipeline в отдельном потоке."""
         try:
             import torch
             
-            with torch.no_grad():  # Экономим память
-                return self.pipeline(**params)
+            with torch.no_grad():
+                return pipeline(**params)
         except Exception as e:
             logger.error(f"❌ Ошибка выполнения pipeline: {e}")
             return None
@@ -529,7 +469,6 @@ class ImageGenerator:
         Returns:
             Промпт для AI генерации
         """
-        # Получаем настройки промптов из конфигурации
         prompts_config = config.diffusion.prompts
         
         # Определяем контент на основе языка текста
@@ -569,6 +508,21 @@ class ImageGenerator:
         result = tokenizer.decode(translated[0], skip_special_tokens=True)
 
         return result
+
+    def _cleanup_directory(self, directory_path: str) -> None:
+        """
+        Очистка директории и её удаление.
+        
+        Args:
+            directory_path: Путь к директории для удаления
+        """
+        try:
+            dir_path = Path(directory_path)
+            if dir_path.exists() and dir_path.is_dir():
+                shutil.rmtree(dir_path)
+                logger.debug(f"🗑️ Удалена директория: {directory_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось удалить директорию {directory_path}: {e}")
 
     def cleanup_temp_files(self, max_age_hours: int = 24) -> None:
         """
@@ -653,12 +607,13 @@ class ImageGenerator:
         Returns:
             dict: Статус различных компонентов
         """
+        gpu_status = self.gpu_pool.get_status()
+        
         return {
             "local_diffusion_available": self._check_dependencies(),
             "local_model": config.diffusion.model,
-            "local_device": self.device,
-            "local_model_loaded": self.model_loaded,
+            "gpu_pool_status": gpu_status,
             "num_images_per_generation": config.diffusion.num_images,
             "dependencies_installed": self._check_dependencies()
         }
-        
+    

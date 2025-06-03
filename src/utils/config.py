@@ -8,7 +8,7 @@ import os
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import time
 
 from dotenv import load_dotenv
@@ -46,6 +46,8 @@ class DiffusionConfig:
     """Конфигурация локальной генерации изображений."""
     model: str = "stabilityai/stable-diffusion-xl-base-1.0"
     device: str = "auto"  # auto, cpu, cuda, mps
+    gpu_devices: List[str] = field(default_factory=list)  # Список GPU устройств для multi-GPU
+    max_queue_size: int = 10  # Максимальный размер очереди ожидания
     width: int = 1024
     height: int = 1024
     num_inference_steps: int = 28
@@ -118,7 +120,24 @@ class Config:
         self._load_main_config()
         self._load_secrets_config()
         self._load_from_env()
+        self._auto_detect_gpus()
         self._create_directories()
+
+    def _auto_detect_gpus(self):
+        """Автоопределение доступных GPU устройств."""
+        if not self.diffusion.gpu_devices and self.diffusion.device == "auto":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_count = torch.cuda.device_count()
+                    self.diffusion.gpu_devices = [f"cuda:{i}" for i in range(gpu_count)]
+                    print(f"✅ Обнаружено {gpu_count} GPU: {self.diffusion.gpu_devices}")
+                else:
+                    self.diffusion.gpu_devices = ["cpu"]
+                    print("✅ GPU не обнаружены, используется CPU")
+            except ImportError:
+                self.diffusion.gpu_devices = ["cpu"]
+                print("⚠️ PyTorch не найден, используется CPU")
 
     def _load_main_config(self):
         """Загрузка основной конфигурации из conf/config.yaml."""
@@ -196,6 +215,10 @@ class Config:
                 self.diffusion.model = model
             if (device := diffusion_config.get("device")) is not None:
                 self.diffusion.device = device
+            if (gpu_devices := diffusion_config.get("gpu_devices")) is not None:
+                self.diffusion.gpu_devices = gpu_devices
+            if (max_queue_size := diffusion_config.get("max_queue_size")) is not None:
+                self.diffusion.max_queue_size = max_queue_size
             if (width := diffusion_config.get("width")) is not None:
                 self.diffusion.width = width
             if (height := diffusion_config.get("height")) is not None:
@@ -304,6 +327,8 @@ class Config:
             self.diffusion.model = model
         if device := os.getenv("DIFFUSION_DEVICE"):
             self.diffusion.device = device
+        if gpu_devices := os.getenv("DIFFUSION_GPU_DEVICES"):
+            self.diffusion.gpu_devices = [d.strip() for d in gpu_devices.split(",")]
         if width := os.getenv("DIFFUSION_WIDTH"):
             try:
                 self.diffusion.width = int(width)
@@ -409,13 +434,20 @@ class Config:
             errors.append(f"❌ Неверное количество изображений: {self.diffusion.num_images}. "
                          f"Должно быть от 1 до 10")
 
+        # Проверка GPU устройств
+        if self.diffusion.gpu_devices:
+            for device in self.diffusion.gpu_devices:
+                if not (device == "cpu" or device.startswith("cuda:") or device == "mps"):
+                    errors.append(f"❌ Неверное GPU устройство: {device}")
+
         # Проверка PyTorch для diffusion
         try:
             import torch
-            if self.diffusion.device == "cuda" and not torch.cuda.is_available():
-                errors.append("❌ CUDA недоступна, но указана в device для diffusion")
-            elif self.diffusion.device == "mps" and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                errors.append("❌ MPS недоступна, но указана в device для diffusion")
+            for device in self.diffusion.gpu_devices:
+                if device.startswith("cuda") and not torch.cuda.is_available():
+                    errors.append("❌ CUDA недоступна, но указана в gpu_devices")
+                elif device == "mps" and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    errors.append("❌ MPS недоступна, но указана в gpu_devices")
         except ImportError:
             errors.append("❌ PyTorch не установлен (требуется для локальной генерации изображений)")
 
@@ -439,6 +471,7 @@ class Config:
             "bot_admin_user_id": self.bot.admin_user_id,
             "diffusion_model": self.diffusion.model,
             "diffusion_device": self.diffusion.device,
+            "diffusion_gpu_devices": self.diffusion.gpu_devices,
             "diffusion_num_images": self.diffusion.num_images,
             "speech_model": self.speech.model_name,
             "speech_device": self.speech.device,
