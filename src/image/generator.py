@@ -1,7 +1,7 @@
 """
 Модуль генерации изображений с использованием локальных Stable Diffusion моделей.
 Создает поздравительные картинки на основе текста с AI-генерацией.
-Поддержка multi-GPU для параллельной генерации.
+Поддержка multi-GPU для параллельной генерации и перевода.
 """
 
 import asyncio
@@ -20,6 +20,144 @@ from transformers import MarianMTModel, MarianTokenizer
 
 # Инициализация логгера
 logger = get_image_logger()
+
+class TranslatorPool:
+    """Пул переводчиков для параллельного перевода текста."""
+    
+    def __init__(self, gpu_devices: List[str]):
+        """
+        Инициализация пула переводчиков.
+        
+        Args:
+            gpu_devices: Список GPU устройств
+        """
+        self.gpu_devices = gpu_devices
+        self.model_name = "Helsinki-NLP/opus-mt-ru-en"
+        self.tokenizers: Dict[str, Any] = {}
+        self.models: Dict[str, Any] = {}
+        self.available_devices = asyncio.Queue(maxsize=len(gpu_devices))
+        self._initialized = False
+        
+        logger.info(f"🔤 Инициализирован пул переводчиков с {len(gpu_devices)} устройствами: {gpu_devices}")
+    
+    async def initialize(self):
+        """Инициализация всех моделей перевода для GPU."""
+        if self._initialized:
+            return
+        
+        logger.info("📥 Загрузка моделей перевода на все устройства...")
+        
+        for device in self.gpu_devices:
+            try:
+                tokenizer, model = await self._load_translator_for_device(device)
+                if tokenizer and model:
+                    self.tokenizers[device] = tokenizer
+                    self.models[device] = model
+                    await self.available_devices.put(device)
+                    logger.info(f"✅ Модель перевода загружена для {device}")
+                else:
+                    logger.error(f"❌ Не удалось загрузить модель перевода для {device}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки модели перевода для {device}: {e}")
+        
+        self._initialized = True
+        logger.info(f"🚀 Пул переводчиков инициализирован с {len(self.models)} активными устройствами")
+    
+    async def _load_translator_for_device(self, device: str):
+        """Загрузка модели перевода для конкретного устройства."""
+        try:
+            import warnings
+            warnings.filterwarnings("ignore", message=".*add_prefix_space.*")
+            
+            # Загружаем в отдельном потоке
+            loop = asyncio.get_event_loop()
+            
+            tokenizer = await loop.run_in_executor(
+                None,
+                MarianTokenizer.from_pretrained,
+                self.model_name
+            )
+            
+            model = await loop.run_in_executor(
+                None,
+                MarianMTModel.from_pretrained,
+                self.model_name
+            )
+            
+            # Перемещаем на устройство
+            if device != "cpu":
+                model = model.to(device)
+            
+            return tokenizer, model
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки переводчика для {device}: {e}")
+            return None, None
+    
+    @asynccontextmanager
+    async def acquire_translator(self):
+        """Контекстный менеджер для получения переводчика из пула."""
+        if not self._initialized:
+            await self.initialize()
+        
+        # Ждем свободное устройство
+        device = await self.available_devices.get()
+        tokenizer = self.tokenizers.get(device)
+        model = self.models.get(device)
+        
+        if not tokenizer or not model:
+            await self.available_devices.put(device)
+            raise RuntimeError(f"Переводчик для {device} недоступен")
+        
+        try:
+            logger.debug(f"🔒 Получен доступ к переводчику {device}")
+            yield device, tokenizer, model
+        finally:
+            # Очищаем память и возвращаем устройство в пул
+            self._cleanup_device_memory(device)
+            await self.available_devices.put(device)
+            logger.debug(f"🔓 Освобожден переводчик {device}")
+    
+    def _cleanup_device_memory(self, device: str):
+        """Очистка памяти конкретного устройства."""
+        try:
+            import torch
+            
+            if device.startswith("cuda"):
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            elif device == "mps":
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+            
+            gc.collect()
+            
+        except Exception as e:
+            logger.debug(f"Ошибка очистки памяти переводчика {device}: {e}")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Получение статуса пула переводчиков."""
+        return {
+            "total_devices": len(self.gpu_devices),
+            "available_devices": self.available_devices.qsize(),
+            "busy_devices": len(self.gpu_devices) - self.available_devices.qsize(),
+            "model_name": self.model_name,
+            "initialized": self._initialized
+        }
+
+# Глобальный пул переводчиков (синглтон)
+_translator_pool: Optional[TranslatorPool] = None
+
+def get_translator_pool() -> TranslatorPool:
+    """Получение глобального пула переводчиков."""
+    global _translator_pool
+    if _translator_pool is None:
+        # Используем те же GPU что и для генерации изображений
+        gpu_devices = config.diffusion.gpu_devices
+        if not gpu_devices:
+            gpu_devices = ["cpu"]  # Fallback
+        _translator_pool = TranslatorPool(gpu_devices)
+    return _translator_pool
 
 class GPUPool:
     """Пул GPU для параллельной генерации изображений."""
@@ -241,6 +379,7 @@ class ImageGenerator:
         """
         self.progress_callback = progress_callback
         self.gpu_pool = get_gpu_pool()
+        self.translator_pool = get_translator_pool()
         
         logger.info("🎨 Инициализирован multi-GPU генератор изображений")
         logger.info(f"   Модель: {config.diffusion.model}")
@@ -374,8 +513,8 @@ class ImageGenerator:
             )
             translation_start_time = time.time()
 
-            prompt = self._create_birthday_prompt(text)
-            logger.info(f"📝 Промпт: {prompt[:100]}...")
+            prompt = await self._create_birthday_prompt(text)
+            logger.info(f"📝 Промпт: {prompt}.")
             
             translation_time = time.time() - translation_start_time
             await self._send_progress_message(
@@ -459,7 +598,7 @@ class ImageGenerator:
             logger.error(f"❌ Ошибка выполнения pipeline: {e}")
             return None
 
-    def _create_birthday_prompt(self, text: str) -> str:
+    async def _create_birthday_prompt(self, text: str) -> str:
         """
         Создание промпта для генерации изображения.
         
@@ -473,7 +612,7 @@ class ImageGenerator:
         
         # Определяем контент на основе языка текста
         if self.has_russian(text):
-            content = self.translate_text(text)
+            content = await self.translate_text(text)
         else:
             content = text
         
@@ -497,17 +636,64 @@ class ImageGenerator:
     def has_russian(self, text):
         return bool(re.search(r"[а-яА-ЯёЁ]", text))
 
-    def translate_text(self, text: str) -> str:
-        # Переводим текст на английский
-        model_name = "Helsinki-NLP/opus-mt-ru-en"
-        tokenizer = MarianTokenizer.from_pretrained(model_name)
-        model = MarianMTModel.from_pretrained(model_name)
-
-        tokens = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        translated = model.generate(**tokens)
-        result = tokenizer.decode(translated[0], skip_special_tokens=True)
-
-        return result
+    async def translate_text(self, text: str) -> str:
+        """
+        Перевод текста на английский с использованием пула переводчиков.
+        
+        Args:
+            text: Текст для перевода
+            
+        Returns:
+            str: Переведенный текст
+        """
+        try:
+            # Получаем переводчик из пула
+            async with self.translator_pool.acquire_translator() as (device, tokenizer, model):
+                logger.debug(f"🔤 Перевод на {device}")
+                
+                # Запускаем перевод в отдельном потоке
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    self._translate_sync,
+                    tokenizer,
+                    model,
+                    text
+                )
+                
+                return result if result else text
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка перевода текста: {e}")
+            return text  # Возвращаем оригинальный текст при ошибке
+    
+    def _translate_sync(self, tokenizer, model, text: str) -> str:
+        """
+        Синхронный перевод текста (выполняется в отдельном потоке).
+        
+        Args:
+            tokenizer: Токенайзер модели
+            model: Модель перевода
+            text: Текст для перевода
+            
+        Returns:
+            str: Переведенный текст
+        """
+        try:
+            tokens = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            
+            # Перемещаем токены на то же устройство что и модель
+            if hasattr(model, 'device'):
+                tokens = {k: v.to(model.device) for k, v in tokens.items()}
+            
+            translated = model.generate(**tokens)
+            result = tokenizer.decode(translated[0], skip_special_tokens=True)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронного перевода: {e}")
+            return text
 
     def _cleanup_directory(self, directory_path: str) -> None:
         """
@@ -608,11 +794,13 @@ class ImageGenerator:
             dict: Статус различных компонентов
         """
         gpu_status = self.gpu_pool.get_status()
+        translator_status = self.translator_pool.get_status()
         
         return {
             "local_diffusion_available": self._check_dependencies(),
             "local_model": config.diffusion.model,
             "gpu_pool_status": gpu_status,
+            "translator_pool_status": translator_status,
             "num_images_per_generation": config.diffusion.num_images,
             "dependencies_installed": self._check_dependencies()
         }

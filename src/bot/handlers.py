@@ -290,7 +290,9 @@ async def handle_generation_request(message: Message, text: str, is_voice: bool 
         
         # Проверяем статус GPU пула
         gpu_status = generator.gpu_pool.get_status()
+        translator_status = generator.translator_pool.get_status()
         logger.debug(f"🎮 GPU статус: {gpu_status}")
+        logger.debug(f"🔤 Переводчик статус: {translator_status}")
         
         # Если очередь переполнена - уведомляем пользователя
         if gpu_status["queue_size"] >= config.diffusion.max_queue_size:
@@ -302,11 +304,14 @@ async def handle_generation_request(message: Message, text: str, is_voice: bool 
             return
         
         # Уведомляем о позиции в очереди если есть ожидание
-        if gpu_status["available_gpus"] == 0:
+        total_busy = gpu_status["busy_gpus"] + translator_status["busy_devices"]
+        total_devices = gpu_status["total_gpus"] + translator_status["total_devices"]
+        
+        if gpu_status["available_gpus"] == 0 or translator_status["available_devices"] == 0:
             queue_position = gpu_status["queue_size"] + 1
             await message.answer(
-                f"⏳ Все GPU заняты. Ваша позиция в очереди: {queue_position}\n"
-                f"Активных GPU: {gpu_status['busy_gpus']}/{gpu_status['total_gpus']}"
+                f"⏳ Обработка запросов. Ваша позиция в очереди: {queue_position}\n"
+                f"Занято устройств: {total_busy}/{total_devices} (GPU + переводчики)"
             )
         
         # Генерируем изображения (может ждать в очереди)
@@ -377,10 +382,10 @@ async def handle_generation_request(message: Message, text: str, is_voice: bool 
     except asyncio.QueueFull:
         # Очередь переполнена
         await message.answer(
-            "⚠️ Слишком много запросов! Все GPU заняты, очередь переполнена.\n"
+            "⚠️ Слишком много запросов! Все устройства заняты, очередь переполнена.\n"
             "Попробуйте через несколько минут."
         )
-        logger.warning(f"⚠️ Очередь GPU переполнена для пользователя {message.from_user.full_name}")
+        logger.warning(f"⚠️ Очередь переполнена для пользователя {message.from_user.full_name}")
         
     except Exception as e:
         logger.error(
@@ -465,6 +470,17 @@ async def handle_voice_message(message: Message):
             await message.answer("❌ Сервис распознавания речи временно недоступен. Попробуйте позже.")
             logger.error(f"❌ Процессор речи недоступен для пользователя {message.from_user.full_name}")
             return
+        
+        # Проверяем статус Whisper пула
+        whisper_status = speech_processor.whisper_pool.get_status()
+        logger.debug(f"🎤 Whisper статус: {whisper_status}")
+        
+        # Уведомляем о позиции в очереди Whisper если есть ожидание
+        if whisper_status["available_devices"] == 0:
+            await message.answer(
+                f"⏳ Все устройства распознавания заняты. Ждем свободное устройство...\n"
+                f"Занято: {whisper_status['busy_devices']}/{whisper_status['total_devices']}"
+            )
         
         await progress_callback(
             "speech_recognition_start",

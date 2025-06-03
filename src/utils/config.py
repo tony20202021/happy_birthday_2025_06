@@ -27,6 +27,7 @@ class SpeechConfig:
     """Конфигурация модуля распознавания речи."""
     model_name: str = "small"
     device: str = "cpu"
+    gpu_devices: List[str] = field(default_factory=list)  # Список GPU устройств для multi-GPU Whisper
     language: str = "ru"
     supported_formats: list = field(default_factory=lambda: [".ogg", ".mp3", ".wav", ".m4a", ".flac"])
     temp_audio_dir: str = "temp/audio"
@@ -125,19 +126,34 @@ class Config:
 
     def _auto_detect_gpus(self):
         """Автоопределение доступных GPU устройств."""
-        if not self.diffusion.gpu_devices and self.diffusion.device == "auto":
+        if self.diffusion.device == "auto" and not self.diffusion.gpu_devices:
             try:
                 import torch
                 if torch.cuda.is_available():
                     gpu_count = torch.cuda.device_count()
                     self.diffusion.gpu_devices = [f"cuda:{i}" for i in range(gpu_count)]
-                    print(f"✅ Обнаружено {gpu_count} GPU: {self.diffusion.gpu_devices}")
+                    print(f"✅ Обнаружено {gpu_count} GPU для генерации изображений: {self.diffusion.gpu_devices}")
                 else:
                     self.diffusion.gpu_devices = ["cpu"]
-                    print("✅ GPU не обнаружены, используется CPU")
+                    print("✅ GPU не обнаружены для генерации, используется CPU")
             except ImportError:
                 self.diffusion.gpu_devices = ["cpu"]
-                print("⚠️ PyTorch не найден, используется CPU")
+                print("⚠️ PyTorch не найден для генерации, используется CPU")
+        
+        # Автоопределение GPU для речи
+        if self.speech.device == "auto" and not self.speech.gpu_devices:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_count = torch.cuda.device_count()
+                    self.speech.gpu_devices = [f"cuda:{i}" for i in range(gpu_count)]
+                    print(f"✅ Обнаружено {gpu_count} GPU для распознавания речи: {self.speech.gpu_devices}")
+                else:
+                    self.speech.gpu_devices = ["cpu"]
+                    print("✅ GPU не обнаружены для речи, используется CPU")
+            except ImportError:
+                self.speech.gpu_devices = ["cpu"]
+                print("⚠️ PyTorch не найден для речи, используется CPU")
 
     def _load_main_config(self):
         """Загрузка основной конфигурации из conf/config.yaml."""
@@ -200,6 +216,8 @@ class Config:
                 self.speech.model_name = model_name
             if (device := speech_config.get("device")) is not None:
                 self.speech.device = device
+            if (gpu_devices := speech_config.get("gpu_devices")) is not None:
+                self.speech.gpu_devices = gpu_devices
             if (language := speech_config.get("language")) is not None:
                 self.speech.language = language
             if (max_duration := speech_config.get("max_audio_duration")) is not None:
@@ -319,6 +337,8 @@ class Config:
             self.speech.model_name = model
         if device := os.getenv("WHISPER_DEVICE"):
             self.speech.device = device
+        if gpu_devices := os.getenv("WHISPER_GPU_DEVICES"):
+            self.speech.gpu_devices = [d.strip() for d in gpu_devices.split(",")]
         if language := os.getenv("WHISPER_LANGUAGE"):
             self.speech.language = language
 
@@ -424,10 +444,15 @@ class Config:
             errors.append(f"❌ Неверная модель Whisper: {self.speech.model_name}. "
                          f"Доступные: {', '.join(valid_whisper_models)}")
 
+        # Проверка устройства для генерации изображений
+        if self.diffusion.device not in ["cpu", "cuda", "mps", "auto"]:
+            errors.append(f"❌ Неверное устройство для генерации: {self.diffusion.device}. "
+                         f"Доступные: cpu, cuda, mps, auto")
+
         # Проверка устройства Whisper
-        if self.speech.device not in ["cpu", "cuda"]:
+        if self.speech.device not in ["cpu", "cuda", "auto"]:
             errors.append(f"❌ Неверное устройство Whisper: {self.speech.device}. "
-                         f"Доступные: cpu, cuda")
+                         f"Доступные: cpu, cuda, auto")
 
         # Проверка количества изображений
         if not (1 <= self.diffusion.num_images <= 10):
@@ -438,16 +463,27 @@ class Config:
         if self.diffusion.gpu_devices:
             for device in self.diffusion.gpu_devices:
                 if not (device == "cpu" or device.startswith("cuda:") or device == "mps"):
-                    errors.append(f"❌ Неверное GPU устройство: {device}")
+                    errors.append(f"❌ Неверное GPU устройство для генерации: {device}")
+        
+        if self.speech.gpu_devices:
+            for device in self.speech.gpu_devices:
+                if not (device == "cpu" or device.startswith("cuda:") or device == "mps"):
+                    errors.append(f"❌ Неверное GPU устройство для речи: {device}")
 
-        # Проверка PyTorch для diffusion
+        # Проверка PyTorch для diffusion и speech
         try:
             import torch
             for device in self.diffusion.gpu_devices:
                 if device.startswith("cuda") and not torch.cuda.is_available():
-                    errors.append("❌ CUDA недоступна, но указана в gpu_devices")
+                    errors.append("❌ CUDA недоступна, но указана в diffusion.gpu_devices")
                 elif device == "mps" and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
-                    errors.append("❌ MPS недоступна, но указана в gpu_devices")
+                    errors.append("❌ MPS недоступна, но указана в diffusion.gpu_devices")
+            
+            for device in self.speech.gpu_devices:
+                if device.startswith("cuda") and not torch.cuda.is_available():
+                    errors.append("❌ CUDA недоступна, но указана в speech.gpu_devices")
+                elif device == "mps" and not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+                    errors.append("❌ MPS недоступна, но указана в speech.gpu_devices")
         except ImportError:
             errors.append("❌ PyTorch не установлен (требуется для локальной генерации изображений)")
 
@@ -475,6 +511,7 @@ class Config:
             "diffusion_num_images": self.diffusion.num_images,
             "speech_model": self.speech.model_name,
             "speech_device": self.speech.device,
+            "speech_gpu_devices": self.speech.gpu_devices,
             "temp_directories_exist": all(
                 Path(getattr(self.paths, attr)).exists()
                 for attr in ["temp_dir", "temp_audio", "temp_images", "logs_dir"]

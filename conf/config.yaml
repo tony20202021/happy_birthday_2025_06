@@ -91,9 +91,17 @@ speech:
   # - large: самая медленная, лучшее качество (~1550MB)
   model_name: "small"
   
-  # Устройство для Whisper (cpu или cuda)
-  # Используйте cuda только если у вас есть совместимую видеокарту NVIDIA
-  device: "cuda"
+  # Устройство для Whisper (cpu, cuda, или auto)
+  # auto - автоматическое определение всех доступных GPU для речи
+  device: "auto"
+  
+  # Список GPU устройств для multi-GPU распознавания речи
+  # Если пустой - будет автоматически определен при device: "auto"
+  # Примеры:
+  # gpu_devices: ["cuda:0", "cuda:1"]  # 2 GPU для речи
+  # gpu_devices: ["cuda:0"]            # 1 GPU для речи
+  # gpu_devices: ["cpu"]               # только CPU
+  gpu_devices: []
   
   # Язык для распознавания речи
   language: "ru"

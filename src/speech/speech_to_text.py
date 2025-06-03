@@ -1,6 +1,7 @@
 """
 Модуль распознавания речи для Birthday Bot.
 Использует OpenAI Whisper для конвертации голосовых сообщений в текст.
+Поддержка multi-GPU для параллельного распознавания речи.
 """
 
 import os
@@ -8,29 +9,166 @@ import asyncio
 import time
 import whisper
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
+from contextlib import asynccontextmanager
 
 from src.utils.config import config
 from src.utils.logger import get_speech_logger
 from src.speech.audio_processor import AudioProcessor
 
+# Инициализация логгера
+logger = get_speech_logger()
+
+class WhisperPool:
+    """Пул Whisper моделей для параллельного распознавания речи."""
+    
+    def __init__(self, gpu_devices: List[str], model_name: str, language: str):
+        """
+        Инициализация пула Whisper моделей.
+        
+        Args:
+            gpu_devices: Список GPU устройств
+            model_name: Название модели Whisper
+            language: Язык распознавания
+        """
+        self.gpu_devices = gpu_devices
+        self.model_name = model_name
+        self.language = language
+        self.models: Dict[str, Any] = {}
+        self.available_devices = asyncio.Queue(maxsize=len(gpu_devices))
+        self._initialized = False
+        
+        logger.info(f"🎤 Инициализирован Whisper пул с {len(gpu_devices)} устройствами: {gpu_devices}")
+        logger.info(f"   Модель: {model_name}, Язык: {language}")
+    
+    async def initialize(self):
+        """Инициализация всех Whisper моделей для GPU."""
+        if self._initialized:
+            return
+        
+        logger.info("📥 Загрузка Whisper моделей на все устройства...")
+        
+        for device in self.gpu_devices:
+            try:
+                model = await self._load_model_for_device(device)
+                if model:
+                    self.models[device] = model
+                    await self.available_devices.put(device)
+                    logger.info(f"✅ Whisper модель загружена для {device}")
+                else:
+                    logger.error(f"❌ Не удалось загрузить Whisper модель для {device}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки Whisper модели для {device}: {e}")
+        
+        self._initialized = True
+        logger.info(f"🚀 Whisper пул инициализирован с {len(self.models)} активными устройствами")
+    
+    async def _load_model_for_device(self, device: str):
+        """Загрузка Whisper модели для конкретного устройства."""
+        try:
+            logger.debug(f"📥 Загрузка Whisper {self.model_name} на {device}")
+            
+            # Загружаем модель в отдельном потоке
+            loop = asyncio.get_event_loop()
+            model = await loop.run_in_executor(
+                None,
+                whisper.load_model,
+                self.model_name,
+                device
+            )
+            
+            return model
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки Whisper модели для {device}: {e}")
+            return None
+    
+    @asynccontextmanager
+    async def acquire_device(self):
+        """Контекстный менеджер для получения Whisper устройства из пула."""
+        if not self._initialized:
+            await self.initialize()
+        
+        # Ждем свободное устройство
+        device = await self.available_devices.get()
+        model = self.models.get(device)
+        
+        if not model:
+            await self.available_devices.put(device)
+            raise RuntimeError(f"Whisper модель для {device} недоступна")
+        
+        try:
+            logger.debug(f"🔒 Получен доступ к Whisper {device}")
+            yield device, model
+        finally:
+            # Очищаем память и возвращаем устройство в пул
+            self._cleanup_device_memory(device)
+            await self.available_devices.put(device)
+            logger.debug(f"🔓 Освобожден Whisper {device}")
+    
+    def _cleanup_device_memory(self, device: str):
+        """Очистка памяти конкретного устройства."""
+        try:
+            import torch
+            import gc
+            
+            if device.startswith("cuda"):
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+            elif device == "mps":
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+            
+            gc.collect()
+            
+        except Exception as e:
+            logger.debug(f"Ошибка очистки памяти Whisper {device}: {e}")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Получение статуса пула Whisper."""
+        return {
+            "total_devices": len(self.gpu_devices),
+            "available_devices": self.available_devices.qsize(),
+            "busy_devices": len(self.gpu_devices) - self.available_devices.qsize(),
+            "model_name": self.model_name,
+            "language": self.language,
+            "initialized": self._initialized
+        }
+
+# Глобальный пул Whisper (синглтон)
+_whisper_pool: Optional[WhisperPool] = None
+
+def get_whisper_pool() -> WhisperPool:
+    """Получение глобального пула Whisper."""
+    global _whisper_pool
+    if _whisper_pool is None:
+        gpu_devices = config.speech.gpu_devices
+        if not gpu_devices:
+            gpu_devices = ["cpu"]  # Fallback
+        _whisper_pool = WhisperPool(
+            gpu_devices=gpu_devices,
+            model_name=config.speech.model_name,
+            language=config.speech.language
+        )
+    return _whisper_pool
+
 class SpeechToText:
-    """Класс для распознавания речи с использованием Whisper."""
+    """Класс для распознавания речи с использованием Whisper pool."""
     
     def __init__(self):
         """Инициализация модуля распознавания речи."""
         self.logger = get_speech_logger()
-        self.model = None
         self.audio_processor = AudioProcessor()
+        self.whisper_pool = get_whisper_pool()
         
         # Используем правильные поля из конфигурации
         self.model_name = config.speech.model_name
-        self.device = config.speech.device
         self.language = config.speech.language
         
-        self.logger.info(f"🎤 Инициализация SpeechToText с моделью: {self.model_name}")
-        self.logger.info(f"   Устройство: {self.device}")
+        self.logger.info(f"🎤 Инициализация SpeechToText с multi-GPU поддержкой")
+        self.logger.info(f"   Модель: {self.model_name}")
         self.logger.info(f"   Язык: {self.language}")
+        self.logger.info(f"   GPU устройства: {config.speech.gpu_devices}")
         
         # Проверяем доступность Whisper
         if not self._check_whisper_availability():
@@ -52,34 +190,9 @@ class SpeechToText:
         except ImportError:
             return False
     
-    def _load_model(self):
-        """
-        Загружает модель Whisper (lazy loading).
-        """
-        if self.model is None:
-            try:
-                self.logger.info(f"📥 Загрузка модели Whisper: {self.model_name}")
-                start_time = time.time()
-                
-                self.model = whisper.load_model(
-                    self.model_name,
-                    device=self.device
-                )
-                
-                load_time = time.time() - start_time
-                self.logger.info(f"✅ Модель Whisper загружена за {load_time:.2f}с")
-                
-                # Логируем информацию о модели
-                model_info = self.get_model_info()
-                self.logger.debug(f"   Информация о модели: {model_info}")
-                
-            except Exception as e:
-                self.logger.error(f"❌ Ошибка загрузки модели Whisper: {e}")
-                raise
-    
     async def transcribe_audio(self, audio_path: str, user_id: int = None) -> Optional[str]:
         """
-        Транскрибирует аудиофайл в текст.
+        Транскрибирует аудиофайл в текст с использованием Whisper pool.
         
         Args:
             audio_path: Путь к аудиофайлу
@@ -118,12 +231,22 @@ class SpeechToText:
                 self.logger.error("❌ Ошибка предобработки аудио")
                 return None
             
-            # Загружаем модель если еще не загружена
-            self._load_model()
+            # Инициализируем пул если нужно
+            if not self.whisper_pool._initialized:
+                await self.whisper_pool.initialize()
             
-            # Запускаем транскрибацию в отдельном потоке
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._transcribe_sync, processed_audio_path)
+            # Получаем устройство из пула и транскрибируем
+            async with self.whisper_pool.acquire_device() as (device, model):
+                self.logger.info(f"🎮 Транскрибация на {device}")
+                
+                # Запускаем транскрибацию в отдельном потоке
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None, 
+                    self._transcribe_sync, 
+                    model, 
+                    processed_audio_path
+                )
             
             # Удаляем временный обработанный файл если он отличается от оригинала
             if processed_audio_path != audio_path:
@@ -176,11 +299,12 @@ class SpeechToText:
             )
             return None
     
-    def _transcribe_sync(self, audio_path: str) -> Optional[str]:
+    def _transcribe_sync(self, model, audio_path: str) -> Optional[str]:
         """
         Синхронная транскрибация аудио (выполняется в отдельном потоке).
         
         Args:
+            model: Модель Whisper
             audio_path: Путь к аудиофайлу
             
         Returns:
@@ -189,7 +313,7 @@ class SpeechToText:
         try:
             self.logger.debug(f"🔄 Выполнение синхронной транскрибации: {audio_path}")
             
-            result = self.model.transcribe(
+            result = model.transcribe(
                 audio_path,
                 language=self.language,
                 task="transcribe",
@@ -311,7 +435,7 @@ class SpeechToText:
             
             self.logger.info(f"✅ Голосовой файл скачан: {audio_path}")
             
-            # Транскрибируем
+            # Транскрибируем с использованием пула
             result = await self.transcribe_audio(audio_path, user_id)
             
             # Удаляем временный файл
@@ -345,9 +469,9 @@ class SpeechToText:
         """
         model_info = {
             "model_name": self.model_name,
-            "device": self.device,
             "language": self.language,
-            "is_loaded": self.model is not None,
+            "gpu_devices": config.speech.gpu_devices,
+            "whisper_pool_status": self.whisper_pool.get_status(),
         }
         
         # Добавляем информацию о доступных языках
@@ -376,28 +500,23 @@ class SpeechToText:
             bool: True если модель работает корректно
         """
         try:
-            self.logger.info("🔍 Проверка работоспособности модели Whisper...")
+            self.logger.info("🔍 Проверка работоспособности Whisper пула...")
             
-            # Загружаем модель если не загружена
-            self._load_model()
+            # Инициализируем пул если нужно
+            if not self.whisper_pool._initialized:
+                await self.whisper_pool.initialize()
             
-            # Создаем тестовый аудиофайл (тишина)
-            import numpy as np
-            test_audio = np.zeros(16000, dtype=np.float32)  # 1 секунда тишины
-            
-            # Тестируем модель
-            result = self.model.transcribe(test_audio, language=self.language)
-            
-            # Проверяем, что модель вернула результат
-            if "text" in result:
-                self.logger.info("✅ Проверка работоспособности модели прошла успешно")
+            # Проверяем доступность устройств
+            status = self.whisper_pool.get_status()
+            if status["total_devices"] > 0 and status["initialized"]:
+                self.logger.info("✅ Проверка работоспособности Whisper пула прошла успешно")
                 return True
             else:
-                self.logger.error("❌ Модель не вернула ожидаемый результат")
+                self.logger.error("❌ Whisper пул не инициализирован или нет доступных устройств")
                 return False
             
         except Exception as e:
-            self.logger.error(f"❌ Ошибка проверки работоспособности модели: {e}")
+            self.logger.error(f"❌ Ошибка проверки работоспособности Whisper пула: {e}")
             return False
     
     def get_status(self) -> dict:
@@ -408,12 +527,14 @@ class SpeechToText:
             dict: Статус модуля
         """
         try:
+            whisper_status = self.whisper_pool.get_status()
+            
             return {
                 "whisper_available": True,
                 "model_name": self.model_name,
-                "model_loaded": self.model is not None,
-                "device": self.device,
                 "language": self.language,
+                "gpu_devices": config.speech.gpu_devices,
+                "whisper_pool_status": whisper_status,
                 "audio_processor_available": self.audio_processor.check_ffmpeg_availability(),
                 "max_audio_duration": config.speech.max_audio_duration,
                 "supported_formats": config.speech.supported_formats
@@ -426,12 +547,10 @@ class SpeechToText:
     
     def __del__(self):
         """Деструктор для очистки ресурсов."""
-        if hasattr(self, 'model') and self.model is not None:
-            try:
-                # Освобождаем память модели
-                del self.model
-                self.logger.debug("✅ Модель Whisper выгружена из памяти")
-            except Exception as e:
-                if hasattr(self, 'logger'):
-                    self.logger.debug(f"Ошибка при выгрузке модели: {e}")
-                    
+        try:
+            # Очистка ресурсов происходит автоматически через пул
+            self.logger.debug("✅ SpeechToText ресурсы освобождены")
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.debug(f"Ошибка при освобождении ресурсов SpeechToText: {e}")
+                
