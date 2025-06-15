@@ -459,7 +459,7 @@ class ImageGenerator:
                 await self.gpu_pool.initialize()
             
             # Генерируем изображения с использованием GPU пула
-            images = await self._generate_with_gpu_pool(text)
+            images, content = await self._generate_with_gpu_pool(text)
             
             if images and len(images) > 0:
                 # Сохраняем все изображения в директорию
@@ -479,7 +479,7 @@ class ImageGenerator:
                 if saved_paths:
                     generation_time = time.time() - start_time
                     logger.info(f"✅ Сгенерировано и сохранено {len(saved_paths)} изображений за {generation_time:.2f}с")
-                    return output_dir
+                    return output_dir, content
                 else:
                     logger.error("❌ Не удалось сохранить ни одного изображения")
                     self._cleanup_directory(output_dir)
@@ -513,7 +513,7 @@ class ImageGenerator:
             )
             translation_start_time = time.time()
 
-            prompt = await self._create_birthday_prompt(text)
+            prompt, content = await self._create_birthday_prompt(text)
             logger.info(f"📝 Промпт: {prompt}.")
             
             translation_time = time.time() - translation_start_time
@@ -555,7 +555,7 @@ class ImageGenerator:
                 if result and hasattr(result, 'images') and result.images:
                     images = result.images
                     logger.info(f"✅ Успешно сгенерировано {len(images)} изображений на {device}")
-                    return images
+                    return images, content
                 else:
                     logger.error("❌ Не удалось получить изображения из результата")
                     return None
@@ -631,7 +631,7 @@ class ImageGenerator:
                 content=content,
             )
         
-        return prompt
+        return prompt, content
 
     def has_russian(self, text):
         return bool(re.search(r"[а-яА-ЯёЁ]", text))

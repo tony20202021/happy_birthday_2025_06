@@ -57,7 +57,7 @@ def get_image_generator():
             image_generator = None
     return image_generator
 
-async def send_to_admin(bot, images_dir: str, user_message: Message, original_text: str, is_voice: bool = False) -> None:
+async def send_to_admin(bot, images_dir: str, user_message: Message, original_text: str, is_voice: bool = False, content: str = None) -> None:
     """
     Отправка копии результата администратору.
     
@@ -83,10 +83,13 @@ async def send_to_admin(bot, images_dir: str, user_message: Message, original_te
 
         username_safe = escape_md(username)
         original_text_safe = escape_md(original_text[:500])
+        content_safe = escape_md(content[:500])
         admin_caption = (
             f"👤 *Пользователь:* ||{username_safe}||\n"
             f"💬 *Текст:*\n"
             f"||{original_text_safe}{'...' if len(original_text) > 500 else ''}||"
+            f"💬 *Перевод:*\n"
+            f"||{content_safe}{'...' if len(content) > 500 else ''}||"
         )
 
         # Получаем пути ко всем изображениям
@@ -315,7 +318,7 @@ async def handle_generation_request(message: Message, text: str, is_voice: bool 
             )
         
         # Генерируем изображения (может ждать в очереди)
-        images_dir = await generator.generate_birthday_image(text, message.from_user.id)
+        images_dir, content = await generator.generate_birthday_image(text, message.from_user.id)
         
         if images_dir and Path(images_dir).exists():
             await progress_callback("sending_images")
@@ -333,7 +336,8 @@ async def handle_generation_request(message: Message, text: str, is_voice: bool 
                     images_dir=images_dir,
                     user_message=message,
                     original_text=text,
-                    is_voice=is_voice
+                    is_voice=is_voice,
+                    content=content,
                 )
                 
                 logger.info(

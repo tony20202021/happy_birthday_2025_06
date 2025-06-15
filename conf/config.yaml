@@ -64,18 +64,22 @@ diffusion:
   # Настройки промптов для генерации
   prompts:
     # Базовый промпт для всех изображений
-    base_picture: "fun, joyful, happy"
+    # base_picture: "fun, joyful, happy"
+    base_picture: ""
     
     # Стилистические указания
-    style: "cartoon, digital art, professional, masterpiece, best quality"
+    style: "joyful cartoon picture"
     
     # Описание главного персонажа
-    subject: "young beautiful woman named Evelina, dark long hair, big eyes"
+    # subject: "young beautiful woman named Evelina, dark long hair, big eyes"
+    subject: "Evelin is a young beautiful woman, dark long hair, big eyes"
     
     # Шаблон полного промпта
     # Используются плейсхолдеры: {picture}, {style}, {subject}, {content}
-    template_with_style: "<picture>{picture}</picture>, <style>{style}</style>, <subject>{subject}</subject>, <content>{content}</content>"
-    template_no_style: "<picture>{picture}</picture>, <subject>{subject}</subject>, <content>{content}</content>"
+    # template_with_style: "<picture>{picture}</picture>, <style>{style}</style>, <subject>{subject}</subject>, <content>{content}</content>"
+    # template_no_style: "<picture>{picture}</picture>, <subject>{subject}</subject>, <content>{content}</content>"
+    template_with_style: "{picture}. {style}. {content}. {subject}"
+    template_no_style: "{picture}. {content}. {subject}"
 
 # =============================================================================
 # НАСТРОЙКИ РАСПОЗНАВАНИЯ РЕЧИ
